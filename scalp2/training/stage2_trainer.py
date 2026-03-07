@@ -118,9 +118,11 @@ class Stage2Trainer:
         hc_test = test_features[seq_len:][:, top_indices]
 
         # 3. Get regime probabilities
+        # Train: forward-backward OK (no leakage within training data)
+        # Val/Test: forward-only to avoid look-ahead via backward pass
         regime_train = regime_detector.predict_proba(train_df_regime.iloc[seq_len:])
-        regime_val = regime_detector.predict_proba(val_df_regime.iloc[seq_len:])
-        regime_test = regime_detector.predict_proba(test_df_regime.iloc[seq_len:])
+        regime_val = regime_detector.predict_proba_online(val_df_regime.iloc[seq_len:])
+        regime_test = regime_detector.predict_proba_online(test_df_regime.iloc[seq_len:])
 
         # Ensure consistent lengths (truncate to shortest)
         min_train = min(len(latent_train), len(hc_train), len(regime_train))

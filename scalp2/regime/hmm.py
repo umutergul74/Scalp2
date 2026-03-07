@@ -13,6 +13,12 @@ from scalp2.config import RegimeConfig
 logger = logging.getLogger(__name__)
 
 
+def _logsumexp_1d(a: np.ndarray) -> float:
+    """Numerically stable log-sum-exp for a 1-D array."""
+    a_max = a.max()
+    return a_max + np.log(np.sum(np.exp(a - a_max)))
+
+
 class RegimeDetector:
     """3-state Gaussian HMM for market regime detection.
 
@@ -150,6 +156,59 @@ class RegimeDetector:
 
         # Reorder columns to [bull, bear, choppy]
         reordered = np.zeros((len(X), 3), dtype=np.float32)
+        for hmm_state, regime_idx in self.state_map.items():
+            reordered[:, regime_idx] = posteriors[:, hmm_state]
+
+        return reordered
+
+    def predict_proba_online(self, df: pd.DataFrame) -> np.ndarray:
+        """Forward-only regime probabilities (no look-ahead bias).
+
+        Uses only the forward pass of the HMM — P(state_t | x_1:t).
+        Unlike predict_proba() which uses forward-backward and leaks
+        future information via the backward pass.
+
+        Args:
+            df: DataFrame with regime feature columns.
+
+        Returns:
+            (n_samples, 3) array with columns [bull_prob, bear_prob, choppy_prob].
+        """
+        if not self._fitted:
+            raise RuntimeError("RegimeDetector must be fitted before prediction.")
+
+        X = self._prepare_features(df)
+
+        if getattr(self, '_fallback', False):
+            return np.full((len(X), 3), 1.0 / 3, dtype=np.float32)
+
+        X_scaled = (X - self._mean) / self._std
+
+        # Emission log-probabilities: (n_samples, n_states)
+        log_emissionprob = self.model._compute_log_likelihood(X_scaled)
+
+        n_samples, n_states = log_emissionprob.shape
+        log_startprob = np.log(self.model.startprob_ + 1e-300)
+        log_transmat = np.log(self.model.transmat_ + 1e-300)
+
+        # Forward pass in log space
+        log_alpha = np.zeros((n_samples, n_states))
+        log_alpha[0] = log_startprob + log_emissionprob[0]
+
+        for t in range(1, n_samples):
+            for j in range(n_states):
+                log_alpha[t, j] = (
+                    _logsumexp_1d(log_alpha[t - 1] + log_transmat[:, j])
+                    + log_emissionprob[t, j]
+                )
+
+        # Normalize: P(state_t | x_1:t) = alpha_t / sum(alpha_t)
+        log_norm = np.array([_logsumexp_1d(row) for row in log_alpha])
+        log_proba = log_alpha - log_norm[:, None]
+        posteriors = np.exp(log_proba)
+
+        # Reorder columns to [bull, bear, choppy]
+        reordered = np.zeros((n_samples, 3), dtype=np.float32)
         for hmm_state, regime_idx in self.state_map.items():
             reordered[:, regime_idx] = posteriors[:, hmm_state]
 
