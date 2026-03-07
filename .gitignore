@@ -45,5 +45,6 @@ tmpclaude-*
 .DS_Store
 Thumbs.db
 
-# Claude internal state
+# Claude internal state (keep commands/ for custom slash commands)
 .claude/
+!.claude/commands/
