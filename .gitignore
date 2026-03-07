@@ -14,8 +14,8 @@ build/
 venv/
 env/
 
-# Data — raw/processed market data, not for VCS
-data/
+# Data — raw/processed market data, not for VCS (root-level only)
+/data/
 
 # Model artifacts and checkpoints
 checkpoints/
