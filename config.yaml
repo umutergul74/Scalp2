@@ -9,7 +9,7 @@ data:
     primary: "15m"
     mtf: ["1h", "4h"]
   date_range:
-    start: "2021-01-01"
+    start: "2020-01-01"
     end: "2026-02-20"
   cache_dir: "./data/raw"
   processed_dir: "./data/processed"
