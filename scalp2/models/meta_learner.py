@@ -39,6 +39,7 @@ class XGBoostMetaLearner:
             "reg_alpha": config.reg_alpha,
             "reg_lambda": config.reg_lambda,
             "tree_method": config.tree_method,
+            "device": config.device,
             "eval_metric": config.eval_metric,
             "seed": 42,
             "verbosity": 1,
