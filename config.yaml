@@ -10,7 +10,7 @@ data:
     mtf: ["1h", "4h"]
   date_range:
     start: "2020-01-01"
-    end: "2026-02-20"
+    end: "2026-03-19"
   cache_dir: "./data/raw"
   processed_dir: "./data/processed"
 
