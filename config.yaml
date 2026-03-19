@@ -141,11 +141,11 @@ regime:
   features: ["log_return", "gk_vol_14", "volume_zscore"]
   covariance_type: "diag"
   n_iter: 100
-  choppy_threshold: 0.4
+  choppy_threshold: 0.55
 
 execution:
-  confidence_threshold: 0.70
-  max_trades_per_day: 2
+  confidence_threshold: 0.52
+  max_trades_per_day: 8
   min_adx: 20
   min_atr_percentile: 0.15
 
@@ -157,8 +157,8 @@ execution:
 
   position_sizing:
     method: "fractional_kelly"
-    max_fraction: 0.02
-    kelly_fraction: 0.25
+    max_fraction: 0.08
+    kelly_fraction: 0.50
     leverage: 10
     maintenance_margin: 0.005
 
