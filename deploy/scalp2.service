@@ -1,0 +1,37 @@
+[Unit]
+Description=Scalp2 Live Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scalp2
+Group=scalp2
+WorkingDirectory=/opt/scalp2
+EnvironmentFile=/opt/scalp2/.env
+
+ExecStart=/opt/scalp2/venv/bin/python -m scalp2.live.bot \
+    --config /opt/scalp2/config.yaml \
+    --checkpoint-dir /opt/scalp2/checkpoints \
+    --state-dir /opt/scalp2/state
+
+# Auto-restart on crash
+Restart=always
+RestartSec=5
+
+# Graceful shutdown (SIGTERM → bot saves state and exits)
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=scalp2
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/scalp2/state /opt/scalp2/logs
+
+[Install]
+WantedBy=multi-user.target

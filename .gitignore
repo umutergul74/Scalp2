@@ -25,6 +25,13 @@ checkpoints/
 *.joblib
 *.xgb
 
+# Secrets — NEVER commit API keys
+.env
+
+# Bot state (ephemeral, auto-generated)
+state/
+bot_state.json
+
 # Logs
 logs/
 *.log
