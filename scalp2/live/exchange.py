@@ -57,6 +57,12 @@ class BinanceExecutor:
             },
         })
 
+        # Enable Binance Testnet (demo.binance.com) if specified
+        is_testnet = os.environ.get("BINANCE_TESTNET", "false").lower() in ("true", "1", "yes")
+        if is_testnet:
+            self.exchange.set_sandbox_mode(True)
+            logger.info("TESTNET MODE ENABLED — Connecting to demo.binance.com")
+
         # Set leverage on init
         if not paper_mode and api_key:
             self._retry(lambda: self.exchange.set_leverage(leverage, self.symbol))
