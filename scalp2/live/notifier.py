@@ -1,4 +1,7 @@
-"""Telegram notification system for trade alerts and daily summaries."""
+"""Async Telegram notification system for trade alerts and daily summaries.
+
+Uses aiohttp for non-blocking HTTP. All methods are coroutines.
+"""
 
 from __future__ import annotations
 
@@ -6,19 +9,25 @@ import logging
 import os
 from datetime import datetime
 
-import requests
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
 # Timeout for Telegram API calls (seconds)
-_TIMEOUT = 10
+_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
 class TelegramNotifier:
-    """Fire-and-forget Telegram notifications.
+    """Fire-and-forget async Telegram notifications.
 
-    All methods are non-blocking and swallow errors so the bot
-    never crashes because of a notification failure.
+    All methods are non-blocking coroutines and swallow errors so
+    the bot never crashes because of a notification failure.
+
+    Usage:
+        notifier = TelegramNotifier()
+        await notifier.info("Bot started")
+        ...
+        await notifier.close()   # cleanup aiohttp session
     """
 
     def __init__(
@@ -29,12 +38,24 @@ class TelegramNotifier:
         self.bot_token = bot_token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
         self.enabled = bool(self.bot_token and self.chat_id)
+        self._session: aiohttp.ClientSession | None = None
         if not self.enabled:
             logger.warning("Telegram notifier disabled (missing token/chat_id)")
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Lazy-init reusable aiohttp session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=_TIMEOUT)
+        return self._session
+
+    async def close(self) -> None:
+        """Close the aiohttp session. Must be called on shutdown."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
     # ── public API ────────────────────────────────────────────────────────
 
-    def trade_opened(
+    async def trade_opened(
         self,
         direction: str,
         entry: float,
@@ -54,9 +75,9 @@ class TelegramNotifier:
             f"Güven : <code>{confidence*100:.1f}%</code>\n"
             f"Rejim : {regime}"
         )
-        self._send(msg)
+        await self._send(msg)
 
-    def trade_closed(
+    async def trade_closed(
         self,
         direction: str,
         entry: float,
@@ -73,9 +94,9 @@ class TelegramNotifier:
             f"PnL   : <code>{'+' if pnl_usd >= 0 else ''}{pnl_usd:,.2f}$"
             f" ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%)</code>"
         )
-        self._send(msg)
+        await self._send(msg)
 
-    def daily_summary(
+    async def daily_summary(
         self,
         date: str,
         trades: int,
@@ -92,9 +113,9 @@ class TelegramNotifier:
             f"PnL   : <code>{'+' if pnl_usd >= 0 else ''}{pnl_usd:,.2f}$</code>\n"
             f"Bakiye: <code>${balance:,.2f}</code>"
         )
-        self._send(msg)
+        await self._send(msg)
 
-    def cycle_summary(
+    async def cycle_summary(
         self,
         time_str: str,
         price: float,
@@ -126,17 +147,17 @@ class TelegramNotifier:
             f"ADX    : <code>{adx:.1f}</code>\n"
             f"{signal_line}"
         )
-        self._send(msg)
+        await self._send(msg)
 
-    def error(self, message: str) -> None:
-        self._send(f"🚨 <b>HATA</b>\n<code>{message[:500]}</code>")
+    async def error(self, message: str) -> None:
+        await self._send(f"🚨 <b>HATA</b>\n<code>{message[:500]}</code>")
 
-    def info(self, message: str) -> None:
-        self._send(f"ℹ️ {message}")
+    async def info(self, message: str) -> None:
+        await self._send(f"ℹ️ {message}")
 
     # ── internal ──────────────────────────────────────────────────────────
 
-    def _send(self, text: str) -> None:
+    async def _send(self, text: str) -> None:
         if not self.enabled:
             return
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
@@ -147,8 +168,10 @@ class TelegramNotifier:
             "disable_web_page_preview": True,
         }
         try:
-            resp = requests.post(url, json=payload, timeout=_TIMEOUT)
-            if resp.status_code != 200:
-                logger.warning("Telegram send failed: %s", resp.text[:200])
+            session = await self._get_session()
+            async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("Telegram send failed: %s", body[:200])
         except Exception as e:
             logger.warning("Telegram send error: %s", e)

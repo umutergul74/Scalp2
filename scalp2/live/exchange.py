@@ -1,4 +1,7 @@
-"""Binance Futures execution — orders, positions, balance.
+"""Binance Futures execution — async orders, positions, balance.
+
+Uses ccxt.async_support for non-blocking I/O. All public methods are
+coroutines and must be awaited.
 
 Supports both live and paper trading modes.
 API keys loaded exclusively from environment variables.
@@ -6,12 +9,13 @@ API keys loaded exclusively from environment variables.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
 from typing import Optional
 
-import ccxt
+import ccxt.async_support as ccxt
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +25,18 @@ _RETRY_DELAYS = [2, 5, 15]  # exponential-ish backoff
 
 
 class BinanceExecutor:
-    """Thin wrapper around CCXT for Binance USDM Futures.
+    """Async wrapper around CCXT for Binance USDM Futures.
 
     Security:
         - API keys from env vars only (never hardcoded)
         - IP whitelist enforced on Binance side
         - Futures-only permission, no withdraw
+
+    Usage:
+        executor = BinanceExecutor()
+        data = await executor.fetch_ohlcv("15m", limit=800)
+        ...
+        await executor.close()   # must close aiohttp session
     """
 
     def __init__(
@@ -63,21 +73,31 @@ class BinanceExecutor:
             self.exchange.set_sandbox_mode(True)
             logger.info("TESTNET MODE ENABLED — Connecting to demo.binance.com")
 
-        # Set leverage on init
-        if not paper_mode and api_key:
-            self._retry(lambda: self.exchange.set_leverage(leverage, self.symbol))
-            logger.info("Leverage set to %dx for %s", leverage, symbol)
-
         mode_str = "PAPER" if paper_mode else "LIVE"
         logger.info("BinanceExecutor initialized: %s mode, %dx leverage", mode_str, leverage)
 
+    async def init(self) -> None:
+        """Async initialization — call after __init__ to set leverage."""
+        if not self.paper_mode and os.environ.get("BINANCE_API_KEY", ""):
+            await self._retry(
+                lambda: self.exchange.set_leverage(self.leverage, self.symbol)
+            )
+            logger.info("Leverage set to %dx for %s", self.leverage, self.symbol)
+
+    async def close(self) -> None:
+        """Close the underlying aiohttp session. Must be called on shutdown."""
+        try:
+            await self.exchange.close()
+        except Exception as e:
+            logger.warning("Exchange session close error: %s", e)
+
     # ── Balance ───────────────────────────────────────────────────────────
 
-    def get_balance(self) -> float:
+    async def get_balance(self) -> float:
         """Get available USDT balance (futures wallet)."""
         if self.paper_mode:
             return 1000.0  # default paper balance
-        balance = self._retry(lambda: self.exchange.fetch_balance())
+        balance = await self._retry(lambda: self.exchange.fetch_balance())
         usdt = balance.get("USDT", {})
         free = usdt.get("free", 0.0)
         logger.info("USDT balance: %.2f (total: %.2f)", free, usdt.get("total", 0.0))
@@ -85,20 +105,20 @@ class BinanceExecutor:
 
     # ── Market Data ───────────────────────────────────────────────────────
 
-    def fetch_ohlcv(self, timeframe: str = "15m", limit: int = 400) -> list:
+    async def fetch_ohlcv(self, timeframe: str = "15m", limit: int = 400) -> list:
         """Fetch OHLCV candles from Binance."""
-        return self._retry(
+        return await self._retry(
             lambda: self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=limit)
         )
 
-    def get_ticker_price(self) -> float:
+    async def get_ticker_price(self) -> float:
         """Get current market price."""
-        ticker = self._retry(lambda: self.exchange.fetch_ticker(self.symbol))
+        ticker = await self._retry(lambda: self.exchange.fetch_ticker(self.symbol))
         return float(ticker["last"])
 
     # ── Order Execution ───────────────────────────────────────────────────
 
-    def open_position(
+    async def open_position(
         self,
         direction: str,
         size_usd: float,
@@ -107,6 +127,9 @@ class BinanceExecutor:
         take_profit: float,
     ) -> dict:
         """Open a new position with SL and TP orders on exchange.
+
+        In live mode, SL and TP are placed concurrently via asyncio.gather()
+        for minimal latency (~500ms saved vs sequential).
 
         Args:
             direction: "LONG" or "SHORT"
@@ -134,7 +157,7 @@ class BinanceExecutor:
             }
 
         # Market entry
-        entry_order = self._retry(
+        entry_order = await self._retry(
             lambda: self.exchange.create_order(
                 symbol=self.symbol,
                 type="market",
@@ -146,27 +169,28 @@ class BinanceExecutor:
         filled_price = float(entry_order.get("average", entry_price))
         logger.info("Entry filled: %s %.6f @ $%.1f (id=%s)", side, amount, filled_price, order_id)
 
-        # SL and TP as stop-market and take-profit-market
+        # SL and TP placed concurrently via asyncio.gather
         close_side = "sell" if direction == "LONG" else "buy"
 
-        sl_order = self._retry(
-            lambda: self.exchange.create_order(
-                symbol=self.symbol,
-                type="stop_market",
-                side=close_side,
-                amount=amount,
-                params={"stopPrice": stop_loss, "closePosition": False},
-            )
-        )
-
-        tp_order = self._retry(
-            lambda: self.exchange.create_order(
-                symbol=self.symbol,
-                type="take_profit_market",
-                side=close_side,
-                amount=amount,
-                params={"stopPrice": take_profit, "closePosition": False},
-            )
+        sl_order, tp_order = await asyncio.gather(
+            self._retry(
+                lambda: self.exchange.create_order(
+                    symbol=self.symbol,
+                    type="stop_market",
+                    side=close_side,
+                    amount=amount,
+                    params={"stopPrice": stop_loss, "closePosition": False},
+                )
+            ),
+            self._retry(
+                lambda: self.exchange.create_order(
+                    symbol=self.symbol,
+                    type="take_profit_market",
+                    side=close_side,
+                    amount=amount,
+                    params={"stopPrice": take_profit, "closePosition": False},
+                )
+            ),
         )
 
         logger.info("SL order placed: $%.1f (id=%s)", stop_loss, sl_order["id"])
@@ -179,7 +203,7 @@ class BinanceExecutor:
             "filled_price": filled_price,
         }
 
-    def close_partial(
+    async def close_partial(
         self,
         direction: str,
         fraction: float,
@@ -190,11 +214,11 @@ class BinanceExecutor:
         close_amount = current_amount * fraction
 
         if self.paper_mode:
-            price = self.get_ticker_price()
+            price = await self.get_ticker_price()
             logger.info("[PAPER] Partial close: %s %.6f BTC @ $%.1f", close_side, close_amount, price)
             return {"order_id": f"paper_partial_{int(time.time())}", "filled_price": price}
 
-        order = self._retry(
+        order = await self._retry(
             lambda: self.exchange.create_order(
                 symbol=self.symbol,
                 type="market",
@@ -206,7 +230,7 @@ class BinanceExecutor:
         logger.info("Partial close filled: %.6f @ $%.1f", close_amount, filled)
         return {"order_id": order["id"], "filled_price": filled}
 
-    def modify_stop_loss(
+    async def modify_stop_loss(
         self,
         old_sl_order_id: str,
         direction: str,
@@ -220,13 +244,13 @@ class BinanceExecutor:
 
         # Cancel old SL
         try:
-            self._retry(lambda: self.exchange.cancel_order(old_sl_order_id, self.symbol))
+            await self._retry(lambda: self.exchange.cancel_order(old_sl_order_id, self.symbol))
         except Exception as e:
             logger.warning("Failed to cancel old SL %s: %s", old_sl_order_id, e)
 
         # Place new SL
         close_side = "sell" if direction == "LONG" else "buy"
-        new_sl = self._retry(
+        new_sl = await self._retry(
             lambda: self.exchange.create_order(
                 symbol=self.symbol,
                 type="stop_market",
@@ -238,31 +262,31 @@ class BinanceExecutor:
         logger.info("New SL placed: $%.1f (id=%s)", new_sl_price, new_sl["id"])
         return new_sl["id"]
 
-    def cancel_all_orders(self) -> None:
+    async def cancel_all_orders(self) -> None:
         """Cancel all open orders for the symbol."""
         if self.paper_mode:
             logger.info("[PAPER] All orders cancelled")
             return
         try:
-            self._retry(lambda: self.exchange.cancel_all_orders(self.symbol))
+            await self._retry(lambda: self.exchange.cancel_all_orders(self.symbol))
             logger.info("All open orders cancelled for %s", self.symbol)
         except Exception as e:
             logger.warning("Failed to cancel all orders: %s", e)
 
-    def close_position(self, direction: str) -> dict:
+    async def close_position(self, direction: str) -> dict:
         """Close entire position at market."""
         if self.paper_mode:
-            price = self.get_ticker_price()
+            price = await self.get_ticker_price()
             logger.info("[PAPER] Full close at $%.1f", price)
             return {"filled_price": price}
 
         # Get current position size
-        positions = self._retry(lambda: self.exchange.fetch_positions([self.symbol]))
+        positions = await self._retry(lambda: self.exchange.fetch_positions([self.symbol]))
         for pos in positions:
             contracts = abs(float(pos.get("contracts", 0)))
             if contracts > 0:
                 close_side = "sell" if direction == "LONG" else "buy"
-                order = self._retry(
+                order = await self._retry(
                     lambda: self.exchange.create_order(
                         symbol=self.symbol,
                         type="market",
@@ -275,9 +299,9 @@ class BinanceExecutor:
                 return {"filled_price": filled}
 
         logger.warning("No open position found to close")
-        return {"filled_price": self.get_ticker_price()}
+        return {"filled_price": await self.get_ticker_price()}
 
-    def get_open_position(self) -> Optional[dict]:
+    async def get_open_position(self) -> Optional[dict]:
         """Check if there's a position open on exchange.
 
         Returns:
@@ -286,7 +310,7 @@ class BinanceExecutor:
         if self.paper_mode:
             return None  # paper mode uses bot state only
 
-        positions = self._retry(lambda: self.exchange.fetch_positions([self.symbol]))
+        positions = await self._retry(lambda: self.exchange.fetch_positions([self.symbol]))
         for pos in positions:
             contracts = abs(float(pos.get("contracts", 0)))
             if contracts > 0:
@@ -301,11 +325,11 @@ class BinanceExecutor:
 
     # ── Retry logic ───────────────────────────────────────────────────────
 
-    def _retry(self, fn, retries: int = _MAX_RETRIES):
-        """Execute with exponential backoff on transient errors."""
+    async def _retry(self, fn, retries: int = _MAX_RETRIES):
+        """Execute with async exponential backoff on transient errors."""
         for attempt in range(retries):
             try:
-                return fn()
+                return await fn()
             except (
                 ccxt.NetworkError,
                 ccxt.ExchangeNotAvailable,
@@ -317,7 +341,7 @@ class BinanceExecutor:
                     "Exchange error (attempt %d/%d): %s — retrying in %ds",
                     attempt + 1, retries, e, delay,
                 )
-                time.sleep(delay)
+                await asyncio.sleep(delay)
             except ccxt.ExchangeError as e:
                 logger.error("Exchange error (non-retryable): %s", e)
                 raise

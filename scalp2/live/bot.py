@@ -1,4 +1,4 @@
-"""Scalp2 Live Trading Bot — 24/7 daemon for VPS deployment.
+"""Scalp2 Live Trading Bot — async 24/7 daemon for VPS deployment.
 
 Usage:
     python -m scalp2.live.bot [--config config.yaml] [--checkpoint-dir ./checkpoints]
@@ -12,9 +12,10 @@ Environment variables required:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
-import signal
+import signal as signal_mod
 import sys
 import time
 from datetime import datetime, timezone
@@ -56,26 +57,23 @@ logger = logging.getLogger(__name__)
 # How long after candle close to start (seconds) — ensures candle is finalized
 _CANDLE_BUFFER_SECS = 5
 
-# How often to check existing positions (seconds)
-_POSITION_CHECK_INTERVAL = 60
-
 # 15-minute interval in seconds
 _INTERVAL_SECS = 15 * 60
 
 
 class LiveBot:
-    """Production-grade 24/7 trading daemon.
+    """Production-grade async 24/7 trading daemon.
 
     Lifecycle:
         1. Load model artifacts from checkpoint
         2. Restore state from JSON (crash recovery)
-        3. Enter main loop:
-           a. Sleep until next 15m candle close
+        3. Enter async main loop:
+           a. Sleep until next 15m candle close (asyncio.sleep)
            b. Fetch data → build features → generate signal
            c. Execute trade if signal is LONG/SHORT
            d. Monitor open positions for TP1/SL
            e. Save state after every action
-        4. On SIGTERM / SIGINT: graceful shutdown
+        4. On SIGTERM / SIGINT: graceful shutdown + close sessions
     """
 
     def __init__(
@@ -128,19 +126,16 @@ class LiveBot:
 
         # Shutdown flag
         self._running = True
-        signal.signal(signal.SIGINT, self._shutdown_handler)
-        signal.signal(signal.SIGTERM, self._shutdown_handler)
 
         mode = "PAPER" if self.paper_mode else "🔴 LIVE"
         logger.info("=" * 60)
-        logger.info("  Scalp2 Live Bot — %s MODE", mode)
+        logger.info("  Scalp2 Live Bot — %s MODE (async)", mode)
         logger.info("  Leverage: %dx | Daily cap: %d",
                      self.config.execution.position_sizing.leverage,
                      self.config.execution.max_trades_per_day)
         logger.info("  Features: %d | Seq len: %d",
                      len(self.feature_names), self.config.model.seq_len)
         logger.info("=" * 60)
-        self.notifier.info(f"Bot başlatıldı — {mode} modu")
 
     # ── Model Loading ─────────────────────────────────────────────────────
 
@@ -182,43 +177,51 @@ class LiveBot:
 
     # ── Main Loop ─────────────────────────────────────────────────────────
 
-    def run(self) -> None:
-        """Main infinite loop — runs until SIGTERM/SIGINT."""
+    async def run(self) -> None:
+        """Async main loop — runs until SIGTERM/SIGINT."""
+        # Async init (set leverage on exchange)
+        await self.executor.init()
+        await self.notifier.info(
+            f"Bot başlatıldı — {'PAPER' if self.paper_mode else '🔴 LIVE'} modu (async)"
+        )
+
         logger.info("Bot running. Waiting for next candle close...")
 
-        while self._running:
-            try:
-                # Wait until next 15m candle close
-                self._wait_for_candle_close()
+        try:
+            while self._running:
+                try:
+                    # Wait until next 15m candle close
+                    await self._wait_for_candle_close()
 
-                if not self._running:
+                    if not self._running:
+                        break
+
+                    now = datetime.now(timezone.utc)
+                    self.state.reset_daily_if_needed(now)
+
+                    # Check if we have an active trade
+                    if self.state.active_trade is not None:
+                        await self._manage_active_trade()
+                    else:
+                        # Generate signal
+                        await self._signal_cycle(now)
+
+                    # Save state after every cycle
+                    self.state.save(self.state_dir)
+
+                except KeyboardInterrupt:
                     break
+                except Exception as e:
+                    logger.error("Main loop error: %s", e, exc_info=True)
+                    await self.notifier.error(str(e))
+                    await asyncio.sleep(30)  # cooldown before retry
 
-                now = datetime.now(timezone.utc)
-                self.state.reset_daily_if_needed(now)
-
-                # Check if we have an active trade
-                if self.state.active_trade is not None:
-                    self._manage_active_trade()
-                else:
-                    # Generate signal
-                    self._signal_cycle(now)
-
-                # Save state after every cycle
-                self.state.save(self.state_dir)
-
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                logger.error("Main loop error: %s", e, exc_info=True)
-                self.notifier.error(str(e))
-                time.sleep(30)  # cooldown before retry
-
-        self._graceful_shutdown()
+        finally:
+            await self._graceful_shutdown()
 
     # ── Signal Cycle ──────────────────────────────────────────────────────
 
-    def _signal_cycle(self, now: datetime) -> None:
+    async def _signal_cycle(self, now: datetime) -> None:
         """Fetch data, generate signal, execute if actionable."""
         # Prevent duplicate signals on same bar
         now_key = now.strftime("%Y-%m-%d %H:%M")
@@ -231,13 +234,13 @@ class LiveBot:
             logger.info("Daily trade limit reached (%d)", self.state.daily_stats.trades)
             return
 
-        # Fetch and prepare data
-        data = self.pipeline.prepare()
+        # Fetch and prepare data (async)
+        data = await self.pipeline.prepare()
         if data is None:
             logger.warning("Data pipeline returned None, skipping cycle")
             return
 
-        # Generate signal via existing SignalGenerator
+        # Generate signal via existing SignalGenerator (CPU-bound, runs sync)
         signal = self.signal_gen.generate(
             features_scaled=data["features_scaled"],
             regime_df=data["regime_df"],
@@ -260,8 +263,8 @@ class LiveBot:
             reason = signal.regime or "unknown"
             logger.info("No trade signal (reason: %s)", reason)
 
-            # Telegram cycle summary
-            self.notifier.cycle_summary(
+            # Telegram cycle summary (async)
+            await self.notifier.cycle_summary(
                 time_str=now_key, price=price, atr=atr,
                 atr_pct=atr_pct, adx=adx,
                 signal="NO_TRADE", reason=reason,
@@ -272,7 +275,7 @@ class LiveBot:
 
         # We have a signal — execute!
         direction = signal.direction.value
-        self.notifier.cycle_summary(
+        await self.notifier.cycle_summary(
             time_str=now_key, price=price, atr=atr,
             atr_pct=atr_pct, adx=adx,
             signal=direction, reason="SIGNAL",
@@ -284,15 +287,15 @@ class LiveBot:
             now_key, price, atr, atr_pct, adx, direction, "SIGNAL",
             signal.confidence, signal.entry_price, signal.stop_loss, signal.take_profit,
         )
-        self._execute_signal(signal, data["current_atr"])
+        await self._execute_signal(signal, data["current_atr"])
 
-    def _execute_signal(self, signal, current_atr: float) -> None:
+    async def _execute_signal(self, signal, current_atr: float) -> None:
         """Place orders on exchange for a trade signal."""
         direction = signal.direction.value
         leverage = self.config.execution.position_sizing.leverage
 
         # Calculate position size in USD
-        balance = self.executor.get_balance()
+        balance = await self.executor.get_balance()
         size_usd = balance * signal.position_size * leverage
 
         if size_usd < 10:  # Binance min notional
@@ -304,8 +307,8 @@ class LiveBot:
             direction, size_usd, signal.position_size * 100, leverage, signal.confidence,
         )
 
-        # Place orders
-        result = self.executor.open_position(
+        # Place orders (SL + TP placed concurrently inside open_position)
+        result = await self.executor.open_position(
             direction=direction,
             size_usd=size_usd,
             entry_price=signal.entry_price,
@@ -330,8 +333,8 @@ class LiveBot:
         )
         self.state.save(self.state_dir)
 
-        # Telegram alert
-        self.notifier.trade_opened(
+        # Telegram alert (async)
+        await self.notifier.trade_opened(
             direction=direction,
             entry=result["filled_price"],
             sl=signal.stop_loss,
@@ -343,7 +346,7 @@ class LiveBot:
 
     # ── Trade Management ──────────────────────────────────────────────────
 
-    def _manage_active_trade(self) -> None:
+    async def _manage_active_trade(self) -> None:
         """Check and manage an open trade — partial TP, breakeven, time stop."""
         trade = self.state.active_trade
         if trade is None:
@@ -353,7 +356,7 @@ class LiveBot:
 
         # Get current price
         try:
-            price = self.executor.get_ticker_price()
+            price = await self.executor.get_ticker_price()
         except Exception as e:
             logger.warning("Failed to get price: %s", e)
             return
@@ -364,11 +367,11 @@ class LiveBot:
 
         # Check if exchange already closed the position (SL/TP hit)
         if not self.paper_mode:
-            pos = self.executor.get_open_position()
+            pos = await self.executor.get_open_position()
             if pos is None:
                 # Position closed by exchange (SL or TP hit)
                 logger.info("Position closed by exchange")
-                self._finalize_trade(price, "exchange_close")
+                await self._finalize_trade(price, "exchange_close")
                 return
 
         # Calculate unrealized PnL
@@ -383,22 +386,22 @@ class LiveBot:
         if self.paper_mode:
             if is_long and price <= trade.stop_loss:
                 sl_pnl = (trade.stop_loss - trade.entry_price) / trade.entry_price
-                self._finalize_trade(trade.stop_loss, "SL", sl_pnl)
+                await self._finalize_trade(trade.stop_loss, "SL", sl_pnl)
                 return
             if not is_long and price >= trade.stop_loss:
                 sl_pnl = (trade.entry_price - trade.stop_loss) / trade.entry_price
-                self._finalize_trade(trade.stop_loss, "SL", sl_pnl)
+                await self._finalize_trade(trade.stop_loss, "SL", sl_pnl)
                 return
 
         # Partial TP check
         if not trade.partial_tp_done and atr_move >= tm.partial_tp_1_atr:
             logger.info("TP1 hit (%.2f ATR), closing 50%%", atr_move)
             amount = trade.position_size_usd / trade.entry_price
-            self.executor.close_partial(trade.direction, tm.partial_tp_1_pct, amount)
+            await self.executor.close_partial(trade.direction, tm.partial_tp_1_pct, amount)
 
             # Move SL to breakeven
             remaining_amount = amount * (1 - tm.partial_tp_1_pct)
-            new_sl_id = self.executor.modify_stop_loss(
+            new_sl_id = await self.executor.modify_stop_loss(
                 old_sl_order_id=trade.sl_order_id,
                 direction=trade.direction,
                 amount=remaining_amount,
@@ -408,11 +411,11 @@ class LiveBot:
             trade.sl_order_id = new_sl_id
             trade.stop_loss = trade.entry_price
             self.state.save(self.state_dir)
-            self.notifier.info(f"TP1 hit — 50% kapatıldı, SL → breakeven (${trade.entry_price:,.1f})")
+            await self.notifier.info(f"TP1 hit — 50% kapatıldı, SL → breakeven (${trade.entry_price:,.1f})")
 
         # Full TP check (paper mode)
         if self.paper_mode and atr_move >= tm.full_tp_atr:
-            self._finalize_trade(price, "TP", unrealized_pct)
+            await self._finalize_trade(price, "TP", unrealized_pct)
             return
 
         # Trailing stop
@@ -422,7 +425,7 @@ class LiveBot:
                 new_sl = price - trail_dist
                 if new_sl > trade.stop_loss:
                     trade.stop_loss = new_sl
-                    self.executor.modify_stop_loss(
+                    await self.executor.modify_stop_loss(
                         trade.sl_order_id, trade.direction,
                         trade.position_size_usd / trade.entry_price,
                         new_sl,
@@ -431,7 +434,7 @@ class LiveBot:
                 new_sl = price + trail_dist
                 if new_sl < trade.stop_loss:
                     trade.stop_loss = new_sl
-                    self.executor.modify_stop_loss(
+                    await self.executor.modify_stop_loss(
                         trade.sl_order_id, trade.direction,
                         trade.position_size_usd / trade.entry_price,
                         new_sl,
@@ -441,11 +444,11 @@ class LiveBot:
         if trade.bars_held >= self.config.labeling.max_holding_bars:
             logger.info("Time barrier reached (%d bars)", trade.bars_held)
             if not self.paper_mode:
-                self.executor.cancel_all_orders()
-                self.executor.close_position(trade.direction)
-            self._finalize_trade(price, "TIME", unrealized_pct)
+                await self.executor.cancel_all_orders()
+                await self.executor.close_position(trade.direction)
+            await self._finalize_trade(price, "TIME", unrealized_pct)
 
-    def _finalize_trade(self, exit_price: float, reason: str, pnl_pct: float | None = None) -> None:
+    async def _finalize_trade(self, exit_price: float, reason: str, pnl_pct: float | None = None) -> None:
         """Record trade completion and clear state."""
         trade = self.state.active_trade
         if trade is None:
@@ -467,7 +470,7 @@ class LiveBot:
             trade.direction, reason, trade.entry_price, exit_price, pnl_usd, pnl_pct * 100,
         )
 
-        self.notifier.trade_closed(
+        await self.notifier.trade_closed(
             direction=trade.direction,
             entry=trade.entry_price,
             exit_price=exit_price,
@@ -525,8 +528,8 @@ class LiveBot:
 
     # ── Scheduler ─────────────────────────────────────────────────────────
 
-    def _wait_for_candle_close(self) -> None:
-        """Sleep until the next 15-minute candle close + buffer."""
+    async def _wait_for_candle_close(self) -> None:
+        """Async sleep until the next 15-minute candle close + buffer."""
         now = datetime.now(timezone.utc)
         current_ts = now.timestamp()
 
@@ -545,16 +548,17 @@ class LiveBot:
         # Sleep in short intervals to allow graceful shutdown
         end_time = time.time() + wait_secs
         while time.time() < end_time and self._running:
-            time.sleep(min(5.0, end_time - time.time()))
+            remaining = end_time - time.time()
+            await asyncio.sleep(min(5.0, remaining))
 
     # ── Shutdown ──────────────────────────────────────────────────────────
 
     def _shutdown_handler(self, signum, frame) -> None:
-        logger.info("Shutdown signal received (%s)", signal.Signals(signum).name)
+        logger.info("Shutdown signal received (%s)", signal_mod.Signals(signum).name)
         self._running = False
 
-    def _graceful_shutdown(self) -> None:
-        """Save state and notify on shutdown. Leave SL/TP orders intact on exchange."""
+    async def _graceful_shutdown(self) -> None:
+        """Save state, close sessions, and notify on shutdown."""
         logger.info("Graceful shutdown...")
         self.state.save(self.state_dir)
 
@@ -562,21 +566,25 @@ class LiveBot:
             logger.info(
                 "Active trade left open with SL/TP on exchange — safe to restart"
             )
-            self.notifier.info(
+            await self.notifier.info(
                 "Bot durduruluyor — açık pozisyon var, SL/TP emirleri borsada duruyor!"
             )
         else:
-            self.notifier.info("Bot durduruluyor — açık pozisyon yok.")
+            await self.notifier.info("Bot durduruluyor — açık pozisyon yok.")
 
         # Daily summary
         ds = self.state.daily_stats
         if ds.trades > 0:
-            balance = self.executor.get_balance()
-            self.notifier.daily_summary(
+            balance = await self.executor.get_balance()
+            await self.notifier.daily_summary(
                 date=ds.date, trades=ds.trades,
                 wins=ds.wins, losses=ds.losses,
                 pnl_usd=ds.pnl_usd, balance=balance,
             )
+
+        # Close async sessions
+        await self.notifier.close()
+        await self.executor.close()
 
         logger.info("Shutdown complete.")
 
@@ -619,7 +627,13 @@ def main():
         state_dir=args.state_dir,
         fold_idx=args.fold,
     )
-    bot.run()
+
+    # Register signal handlers
+    signal_mod.signal(signal_mod.SIGINT, bot._shutdown_handler)
+    signal_mod.signal(signal_mod.SIGTERM, bot._shutdown_handler)
+
+    # Run the async event loop
+    asyncio.run(bot.run())
 
 
 if __name__ == "__main__":

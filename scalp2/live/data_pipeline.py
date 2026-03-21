@@ -1,4 +1,4 @@
-"""Live data pipeline — fetch candles, build features, prepare model input."""
+"""Async live data pipeline — fetch candles, build features, prepare model input."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ _WARMUP_BARS = 800
 
 
 class DataPipeline:
-    """Fetch live candles, compute all features, scale, and return model-ready window.
+    """Async data pipeline: fetch live candles, compute features, scale, return model-ready window.
 
     Reuses the exact same feature engineering as training to avoid
     train/live skew.
@@ -42,7 +42,7 @@ class DataPipeline:
         self.feature_names = feature_names
         self.seq_len = config.model.seq_len
 
-    def prepare(self) -> Optional[dict]:
+    async def prepare(self) -> Optional[dict]:
         """Fetch data, build features, scale, and return model input.
 
         Returns:
@@ -57,8 +57,8 @@ class DataPipeline:
             or None if data fetch fails.
         """
         try:
-            # Fetch 15m candles
-            raw_15m = self.executor.fetch_ohlcv("15m", limit=_WARMUP_BARS)
+            # Fetch 15m candles (async)
+            raw_15m = await self.executor.fetch_ohlcv("15m", limit=_WARMUP_BARS)
             if not raw_15m or len(raw_15m) < self.seq_len + 100:
                 logger.error("Insufficient 15m data: %d bars", len(raw_15m) if raw_15m else 0)
                 return None
@@ -66,7 +66,7 @@ class DataPipeline:
             df_15m = self._candles_to_df(raw_15m)
             df_15m = clean_ohlcv(df_15m, "15m")
 
-            # Resample to 1H and 4H
+            # Resample to 1H and 4H (CPU-bound, runs sync)
             df_1h = resample_ohlcv(df_15m, "1h")
             df_4h = resample_ohlcv(df_15m, "4h")
 
