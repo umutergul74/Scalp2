@@ -148,7 +148,7 @@ execution:
     enabled: true
     blocked_hours_utc: [3, 4, 11, 12, 20]
 
-  confidence_threshold: 0.52
+  confidence_threshold: 0.55
   max_trades_per_day: 12
   min_adx: 20
   min_atr_percentile: 0.05
