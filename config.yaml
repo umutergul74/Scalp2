@@ -150,7 +150,7 @@ execution:
 
   confidence_threshold: 0.55
   max_trades_per_day: 12
-  min_adx: 20
+  min_adx: 25
   min_atr_percentile: 0.05
 
   order_execution:
