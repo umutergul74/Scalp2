@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal as signal_mod
@@ -123,6 +124,10 @@ class LiveBot:
         # State (restore from disk)
         self.state = BotState.load(self.state_dir)
         self.state.paper_mode = self.paper_mode
+
+        # Restore online HMM stats if enabled
+        if self.config.regime.online_update_enabled and self.regime_detector is not None:
+            self._load_regime_stats()
 
         # Shutdown flag
         self._running = True
@@ -275,6 +280,8 @@ class LiveBot:
             )
             # CSV log
             self._log_cycle_csv(now_key, price, atr, atr_pct, adx, "NO_TRADE", reason)
+            # Online HMM update even when no trade
+            self._try_online_hmm_update(data)
             return
 
         # We have a signal — execute!
@@ -295,6 +302,51 @@ class LiveBot:
             signal.confidence, signal.entry_price, signal.stop_loss, signal.take_profit,
         )
         await self._execute_signal(signal, data["current_atr"])
+
+        # Online HMM update with latest bar
+        self._try_online_hmm_update(data)
+
+    def _try_online_hmm_update(self, data: dict) -> None:
+        """Update HMM parameters with the latest bar if online updates enabled."""
+        if (
+            self.regime_detector is not None
+            and self.config.regime.online_update_enabled
+            and data.get("regime_df") is not None
+        ):
+            try:
+                updated = self.regime_detector.update_online(
+                    data["regime_df"].iloc[-1:]
+                )
+                if updated:
+                    logger.info("HMM parameters re-estimated from online data")
+                    self._save_regime_stats()
+            except Exception as e:
+                logger.warning("HMM online update failed: %s", e)
+
+    def _save_regime_stats(self) -> None:
+        """Save HMM online stats to disk for crash recovery."""
+        stats = self.regime_detector.get_online_stats_dict()
+        if stats is None:
+            return
+        path = self.state_dir / "regime_online_stats.json"
+        with open(path, "w") as f:
+            json.dump(stats, f)
+
+    def _load_regime_stats(self) -> None:
+        """Restore HMM online stats from disk after restart."""
+        path = self.state_dir / "regime_online_stats.json"
+        if not path.exists():
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.regime_detector.set_online_stats_dict(data)
+            logger.info(
+                "Restored HMM online stats (%d bars seen)",
+                data.get("total_bars_seen", 0),
+            )
+        except Exception as e:
+            logger.warning("Failed to load regime stats: %s — starting fresh", e)
 
     async def _execute_signal(self, signal, current_atr: float) -> None:
         """Place orders on exchange for a trade signal."""
@@ -570,6 +622,10 @@ class LiveBot:
         """Save state, close sessions, and notify on shutdown."""
         logger.info("Graceful shutdown...")
         self.state.save(self.state_dir)
+
+        # Persist HMM online stats
+        if self.config.regime.online_update_enabled and self.regime_detector is not None:
+            self._save_regime_stats()
 
         if self.state.active_trade is not None:
             logger.info(

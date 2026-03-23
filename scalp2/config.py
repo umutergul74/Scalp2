@@ -230,6 +230,11 @@ class RegimeConfig:
     covariance_type: str = "diag"
     n_iter: int = 100
     choppy_threshold: float = 0.5
+    # Online update settings
+    online_update_enabled: bool = False
+    online_decay_factor: float = 0.995
+    online_update_interval: int = 96
+    online_min_samples: int = 192
 
 
 # ── Execution ─────────────────────────────────────────────────────────────────

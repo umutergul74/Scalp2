@@ -3,12 +3,28 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 from hmmlearn.hmm import GaussianHMM
 
 from scalp2.config import RegimeConfig
+
+
+@dataclass
+class _OnlineStats:
+    """Exponential-decay sufficient statistics for online HMM update."""
+
+    N: np.ndarray  # (n_states,) weighted counts per state
+    S: np.ndarray  # (n_states, n_features) weighted feature sums
+    SS: np.ndarray  # (n_states, n_features) weighted feature sum-of-squares
+    trans_counts: np.ndarray  # (n_states, n_states) transition counts
+    feat_mean: np.ndarray  # (n_features,) running feature mean
+    feat_var: np.ndarray  # (n_features,) running feature variance
+    feat_count: float  # effective sample count for EMA
+    total_bars_seen: int = 0
+    bars_since_update: int = 0
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +147,10 @@ class RegimeDetector:
         )
 
         self._fitted = True
+
+        if self.config.online_update_enabled and not self._fallback:
+            self._init_online_stats()
+
         return self
 
     def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
@@ -153,12 +173,49 @@ class RegimeDetector:
 
         X_scaled = (X - self._mean) / self._std
         posteriors = self.model.predict_proba(X_scaled)
+        return self._reorder_to_regime(posteriors)
 
-        # Reorder columns to [bull, bear, choppy]
-        reordered = np.zeros((len(X), 3), dtype=np.float32)
+    def _forward_pass(self, X_scaled: np.ndarray) -> np.ndarray:
+        """Run forward-only HMM pass in log space.
+
+        Args:
+            X_scaled: (n_samples, n_features) standardized features.
+
+        Returns:
+            log_alpha: (n_samples, n_states) log forward variables.
+        """
+        log_emissionprob = self.model._compute_log_likelihood(X_scaled)
+        n_samples, n_states = log_emissionprob.shape
+        log_startprob = np.log(self.model.startprob_ + 1e-300)
+        log_transmat = np.log(self.model.transmat_ + 1e-300)
+
+        log_alpha = np.zeros((n_samples, n_states))
+        log_alpha[0] = log_startprob + log_emissionprob[0]
+
+        for t in range(1, n_samples):
+            for j in range(n_states):
+                log_alpha[t, j] = (
+                    _logsumexp_1d(log_alpha[t - 1] + log_transmat[:, j])
+                    + log_emissionprob[t, j]
+                )
+        return log_alpha
+
+    def _forward_only_gamma(self, X_scaled: np.ndarray) -> np.ndarray:
+        """Forward-only state responsibilities: P(state_t | x_1:t).
+
+        Returns:
+            (n_samples, n_states) normalized forward probabilities.
+        """
+        log_alpha = self._forward_pass(X_scaled)
+        log_norm = np.array([_logsumexp_1d(row) for row in log_alpha])
+        log_proba = log_alpha - log_norm[:, None]
+        return np.exp(log_proba)
+
+    def _reorder_to_regime(self, posteriors: np.ndarray) -> np.ndarray:
+        """Reorder HMM state columns to [bull, bear, choppy]."""
+        reordered = np.zeros((len(posteriors), 3), dtype=np.float32)
         for hmm_state, regime_idx in self.state_map.items():
             reordered[:, regime_idx] = posteriors[:, hmm_state]
-
         return reordered
 
     def predict_proba_online(self, df: pd.DataFrame) -> np.ndarray:
@@ -183,36 +240,8 @@ class RegimeDetector:
             return np.full((len(X), 3), 1.0 / 3, dtype=np.float32)
 
         X_scaled = (X - self._mean) / self._std
-
-        # Emission log-probabilities: (n_samples, n_states)
-        log_emissionprob = self.model._compute_log_likelihood(X_scaled)
-
-        n_samples, n_states = log_emissionprob.shape
-        log_startprob = np.log(self.model.startprob_ + 1e-300)
-        log_transmat = np.log(self.model.transmat_ + 1e-300)
-
-        # Forward pass in log space
-        log_alpha = np.zeros((n_samples, n_states))
-        log_alpha[0] = log_startprob + log_emissionprob[0]
-
-        for t in range(1, n_samples):
-            for j in range(n_states):
-                log_alpha[t, j] = (
-                    _logsumexp_1d(log_alpha[t - 1] + log_transmat[:, j])
-                    + log_emissionprob[t, j]
-                )
-
-        # Normalize: P(state_t | x_1:t) = alpha_t / sum(alpha_t)
-        log_norm = np.array([_logsumexp_1d(row) for row in log_alpha])
-        log_proba = log_alpha - log_norm[:, None]
-        posteriors = np.exp(log_proba)
-
-        # Reorder columns to [bull, bear, choppy]
-        reordered = np.zeros((n_samples, 3), dtype=np.float32)
-        for hmm_state, regime_idx in self.state_map.items():
-            reordered[:, regime_idx] = posteriors[:, hmm_state]
-
-        return reordered
+        gamma = self._forward_only_gamma(X_scaled)
+        return self._reorder_to_regime(gamma)
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         """Predict most likely regime per bar.
@@ -258,3 +287,170 @@ class RegimeDetector:
         """
         probs = self.predict_proba_online(df)
         return probs[:, self.CHOPPY] <= self.config.choppy_threshold
+
+    # ── Online HMM Update ────────────────────────────────────────────────
+
+    def _init_online_stats(self) -> None:
+        """Initialize online sufficient statistics from the fitted HMM."""
+        n_states = self.config.n_states
+        init_weight = float(self.config.online_min_samples)
+
+        # Seed sufficient stats from trained model parameters
+        self._online_stats = _OnlineStats(
+            N=np.full(n_states, init_weight / n_states),
+            S=self.model.means_.copy() * (init_weight / n_states),
+            SS=(self.model.covars_.copy() + self.model.means_ ** 2)
+            * (init_weight / n_states),
+            trans_counts=self.model.transmat_.copy() * init_weight,
+            feat_mean=self._mean.copy(),
+            feat_var=(self._std**2).copy(),
+            feat_count=init_weight,
+        )
+
+    def update_online(self, df: pd.DataFrame) -> bool:
+        """Update HMM parameters with new data using exponential decay.
+
+        Args:
+            df: DataFrame with new bars (1 or more rows).
+
+        Returns:
+            True if parameters were re-estimated this call.
+        """
+        if not self._fitted:
+            raise RuntimeError("Must fit() before update_online().")
+        if not self.config.online_update_enabled:
+            raise RuntimeError("Online updates not enabled in config.")
+        if getattr(self, "_fallback", False):
+            return False
+
+        # Lazy init: handles old pickled models that predate online update
+        if not hasattr(self, "_online_stats"):
+            self._init_online_stats()
+
+        stats = self._online_stats
+        decay = self.config.online_decay_factor
+        n_new = len(df)
+
+        # 1. Prepare raw features
+        X_raw = self._prepare_features(df)
+
+        # 2. Update running feature standardization (EMA)
+        for i in range(n_new):
+            stats.feat_count = stats.feat_count * decay + 1.0
+            alpha = 1.0 / stats.feat_count
+            delta = X_raw[i] - stats.feat_mean
+            stats.feat_mean = stats.feat_mean + alpha * delta
+            stats.feat_var = stats.feat_var + alpha * (
+                delta * (X_raw[i] - stats.feat_mean) - stats.feat_var
+            )
+
+        # 3. Standardize with current _mean/_std
+        X_scaled = (X_raw - self._mean) / self._std
+
+        # 4. Forward-only pass for state responsibilities
+        gamma = self._forward_only_gamma(X_scaled)
+
+        # 5. Decay existing stats then accumulate new
+        batch_decay = decay**n_new
+        stats.N *= batch_decay
+        stats.S *= batch_decay
+        stats.SS *= batch_decay
+        stats.trans_counts *= batch_decay
+
+        for t in range(n_new):
+            g = gamma[t]
+            x = X_scaled[t]
+            stats.N += g
+            stats.S += g[:, None] * x[None, :]
+            stats.SS += g[:, None] * (x[None, :] ** 2)
+
+            if t > 0:
+                stats.trans_counts += np.outer(gamma[t - 1], gamma[t])
+
+        stats.total_bars_seen += n_new
+        stats.bars_since_update += n_new
+
+        # 6. Re-estimate if enough data accumulated
+        updated = False
+        if (
+            stats.total_bars_seen >= self.config.online_min_samples
+            and stats.bars_since_update >= self.config.online_update_interval
+        ):
+            self._reestimate_from_stats()
+            stats.bars_since_update = 0
+            updated = True
+
+        return updated
+
+    def _reestimate_from_stats(self) -> None:
+        """Re-estimate HMM parameters from accumulated sufficient statistics."""
+        stats = self._online_stats
+        eps = 1e-3
+        blend = 0.3
+
+        # Emission means
+        new_means = stats.S / (stats.N[:, None] + eps)
+
+        # Emission covariances (diagonal)
+        new_covars = stats.SS / (stats.N[:, None] + eps) - new_means**2
+        new_covars = np.maximum(new_covars, self.model.min_covar)
+
+        # Transition matrix
+        row_sums = stats.trans_counts.sum(axis=1, keepdims=True) + eps
+        new_transmat = stats.trans_counts / row_sums
+
+        # Smooth blend: 30% new + 70% old
+        self.model.means_ = (1 - blend) * self.model.means_ + blend * new_means
+        self.model.covars_ = (1 - blend) * self.model.covars_ + blend * new_covars
+        self.model.transmat_ = (
+            (1 - blend) * self.model.transmat_ + blend * new_transmat
+        )
+
+        # Re-normalize transition matrix rows
+        self.model.transmat_ /= self.model.transmat_.sum(axis=1, keepdims=True)
+
+        # Update feature standardization
+        new_std = np.sqrt(np.maximum(stats.feat_var, 1e-8))
+        self._mean = (1 - blend) * self._mean + blend * stats.feat_mean
+        self._std = (1 - blend) * self._std + blend * new_std
+
+        # state_map is NEVER changed — frozen at fit() time
+
+        logger.info(
+            "HMM online update: %d bars total, means=[%.6f, %.6f, %.6f]",
+            stats.total_bars_seen,
+            self.model.means_[0, 0],
+            self.model.means_[1, 0],
+            self.model.means_[2, 0],
+        )
+
+    def get_online_stats_dict(self) -> dict | None:
+        """Export online stats as a JSON-serializable dict."""
+        if not hasattr(self, "_online_stats"):
+            return None
+        s = self._online_stats
+        return {
+            "N": s.N.tolist(),
+            "S": s.S.tolist(),
+            "SS": s.SS.tolist(),
+            "trans_counts": s.trans_counts.tolist(),
+            "feat_mean": s.feat_mean.tolist(),
+            "feat_var": s.feat_var.tolist(),
+            "feat_count": s.feat_count,
+            "total_bars_seen": s.total_bars_seen,
+            "bars_since_update": s.bars_since_update,
+        }
+
+    def set_online_stats_dict(self, data: dict) -> None:
+        """Restore online stats from a saved dict."""
+        self._online_stats = _OnlineStats(
+            N=np.array(data["N"]),
+            S=np.array(data["S"]),
+            SS=np.array(data["SS"]),
+            trans_counts=np.array(data["trans_counts"]),
+            feat_mean=np.array(data["feat_mean"]),
+            feat_var=np.array(data["feat_var"]),
+            feat_count=data["feat_count"],
+            total_bars_seen=data["total_bars_seen"],
+            bars_since_update=data["bars_since_update"],
+        )
