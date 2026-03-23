@@ -163,6 +163,9 @@ class LiveBot:
         self.top_indices = artifacts["top_feature_indices"]
         self.feature_names = artifacts["feature_names"]
         self.regime_detector = artifacts.get("regime_detector", None)
+        # Sync pickled regime detector config with current config.yaml
+        if self.regime_detector is not None:
+            self.regime_detector.config = self.config.regime
 
         # Build encoder on CPU (inference only, fast enough)
         self.encoder = HybridEncoder(
