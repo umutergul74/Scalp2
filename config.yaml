@@ -142,7 +142,7 @@ regime:
   covariance_type: "diag"
   n_iter: 100
   choppy_threshold: 0.55
-  online_update_enabled: false
+  online_update_enabled: true
   online_decay_factor: 0.995
   online_update_interval: 96
   online_min_samples: 192
