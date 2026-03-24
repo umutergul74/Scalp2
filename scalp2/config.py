@@ -306,6 +306,7 @@ class ExecutionConfig:
     max_trades_per_day: int = 2
     min_adx: float = 20.0
     min_atr_percentile: float = 0.15
+    choppy_adx_override: float = 35.0
     time_of_day_filter: TimeOfDayFilterConfig = field(
         default_factory=TimeOfDayFilterConfig
     )

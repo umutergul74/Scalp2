@@ -135,10 +135,16 @@ class SignalGenerator:
         probs = self.meta_learner.predict_proba(meta_features)[0]
         prob_dict = {"short": float(probs[0]), "hold": float(probs[1]), "long": float(probs[2])}
 
-        # 4. Check choppy regime
-        if regime_probs[-1, RegimeDetector.CHOPPY] > self.config.regime.choppy_threshold:
+        # 4. Check choppy regime (with ADX override)
+        is_choppy = regime_probs[-1, RegimeDetector.CHOPPY] > self.config.regime.choppy_threshold
+        if is_choppy and current_adx < exec_cfg.choppy_adx_override:
             logger.info("Choppy regime detected (P=%.3f), skipping", regime_probs[-1, 2])
             return self._no_trade(current_price, current_time, f"choppy_{current_regime}", market_regime=current_regime, probs=prob_dict)
+        if is_choppy:
+            logger.info(
+                "Choppy override: ADX=%.1f >= %.1f, proceeding despite P(choppy)=%.3f",
+                current_adx, exec_cfg.choppy_adx_override, regime_probs[-1, 2],
+            )
 
         # 5. Check Time-of-Day Filter
         if exec_cfg.time_of_day_filter.enabled:
