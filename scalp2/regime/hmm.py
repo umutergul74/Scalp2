@@ -370,6 +370,15 @@ class RegimeDetector:
         stats.total_bars_seen += n_new
         stats.bars_since_update += n_new
 
+        # Progress log every 24 bars (~6 hours)
+        if stats.total_bars_seen % 24 == 0 or stats.total_bars_seen <= 2:
+            logger.info(
+                "HMM online: %d/%d bars collected (next update at %d)",
+                stats.total_bars_seen,
+                self.config.online_min_samples,
+                self.config.online_update_interval,
+            )
+
         # 6. Re-estimate if enough data accumulated
         updated = False
         if (
