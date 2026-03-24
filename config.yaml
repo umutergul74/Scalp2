@@ -178,6 +178,14 @@ execution:
     breakeven_trigger_atr: 0.8
     trailing_activation_atr: 1.2
     trailing_distance_atr: 0.6
+    adaptive_tp_sl:
+      enabled: true
+      high_vol_pctile: 0.80
+      low_vol_pctile: 0.30
+      high_vol_tp_scale: 1.3
+      high_vol_sl_scale: 1.2
+      low_vol_tp_scale: 0.7
+      low_vol_sl_scale: 0.8
 
   slippage_model:
     base_bps: 2.0

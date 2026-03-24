@@ -35,6 +35,11 @@ class TradeState:
     max_favorable_excursion: float = 0.0
     pnl: float = 0.0
     partial_fills: list = field(default_factory=list)
+    # Adaptive TP/SL overrides (None = use config defaults)
+    adaptive_partial_tp_atr: float | None = None
+    adaptive_full_tp_atr: float | None = None
+    adaptive_trailing_act_atr: float | None = None
+    adaptive_trailing_dist_atr: float | None = None
 
 
 class TradeManager:
@@ -110,11 +115,13 @@ class TradeManager:
         # Check partial TP
         atr_move = favorable * trade.entry_price / (trade.atr_at_entry + 1e-10)
 
-        if trade.status == TradeStatus.OPEN and atr_move >= self.config.partial_tp_1_atr:
+        partial_tp = trade.adaptive_partial_tp_atr or self.config.partial_tp_1_atr
+        if trade.status == TradeStatus.OPEN and atr_move >= partial_tp:
             self._execute_partial_tp(trade, current_close, is_long)
 
         # Check full TP
-        if atr_move >= self.config.full_tp_atr:
+        full_tp = trade.adaptive_full_tp_atr or self.config.full_tp_atr
+        if atr_move >= full_tp:
             trade.pnl += unrealized * trade.remaining_size
             trade.remaining_size = 0.0
             trade.status = TradeStatus.CLOSED_TP
@@ -122,7 +129,8 @@ class TradeManager:
             return trade
 
         # Trailing stop adjustment
-        if atr_move >= self.config.trailing_activation_atr:
+        trailing_act = trade.adaptive_trailing_act_atr or self.config.trailing_activation_atr
+        if atr_move >= trailing_act:
             self._update_trailing_stop(trade, current_close, is_long)
 
         return trade
@@ -183,7 +191,7 @@ class TradeManager:
         self, trade: TradeState, price: float, is_long: bool
     ) -> None:
         """Update trailing stop behind price."""
-        trail_dist = self.config.trailing_distance_atr * trade.atr_at_entry
+        trail_dist = (trade.adaptive_trailing_dist_atr or self.config.trailing_distance_atr) * trade.atr_at_entry
 
         if is_long:
             new_sl = price - trail_dist

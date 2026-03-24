@@ -379,6 +379,7 @@ class LiveBot:
         )
 
         # Record active trade in state
+        adaptive = signal.adaptive_tp_sl or {}
         self.state.active_trade = ActiveTrade(
             direction=direction,
             entry_price=result["filled_price"],
@@ -392,6 +393,10 @@ class LiveBot:
             order_id=result["order_id"],
             sl_order_id=result["sl_order_id"],
             tp_order_id=result["tp_order_id"],
+            adaptive_partial_tp_atr=adaptive.get("adaptive_partial_tp_atr"),
+            adaptive_full_tp_atr=adaptive.get("adaptive_full_tp_atr"),
+            adaptive_trailing_act_atr=adaptive.get("adaptive_trailing_act_atr"),
+            adaptive_trailing_dist_atr=adaptive.get("adaptive_trailing_dist_atr"),
         )
         self.state.save(self.state_dir)
 
@@ -457,7 +462,8 @@ class LiveBot:
                 return
 
         # Partial TP check
-        if not trade.partial_tp_done and atr_move >= tm.partial_tp_1_atr:
+        partial_tp_threshold = trade.adaptive_partial_tp_atr or tm.partial_tp_1_atr
+        if not trade.partial_tp_done and atr_move >= partial_tp_threshold:
             logger.info("TP1 hit (%.2f ATR), closing 50%%", atr_move)
             amount = trade.position_size_usd / trade.entry_price
             await self.executor.close_partial(trade.direction, tm.partial_tp_1_pct, amount)
@@ -477,13 +483,15 @@ class LiveBot:
             await self.notifier.info(f"TP1 hit — 50% kapatıldı, SL → breakeven (${trade.entry_price:,.1f})")
 
         # Full TP check (paper mode)
-        if self.paper_mode and atr_move >= tm.full_tp_atr:
+        full_tp_threshold = trade.adaptive_full_tp_atr or tm.full_tp_atr
+        if self.paper_mode and atr_move >= full_tp_threshold:
             await self._finalize_trade(price, "TP", unrealized_pct)
             return
 
         # Trailing stop
-        if atr_move >= tm.trailing_activation_atr:
-            trail_dist = tm.trailing_distance_atr * atr
+        trailing_act = trade.adaptive_trailing_act_atr or tm.trailing_activation_atr
+        if atr_move >= trailing_act:
+            trail_dist = (trade.adaptive_trailing_dist_atr or tm.trailing_distance_atr) * atr
             if is_long:
                 new_sl = price - trail_dist
                 if new_sl > trade.stop_loss:

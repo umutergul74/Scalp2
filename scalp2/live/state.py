@@ -32,6 +32,11 @@ class ActiveTrade:
     tp_order_id: str = ""
     partial_tp_done: bool = False    # True if TP1 (50%) already hit
     bars_held: int = 0
+    # Adaptive TP/SL overrides (None = use config defaults)
+    adaptive_partial_tp_atr: float | None = None
+    adaptive_full_tp_atr: float | None = None
+    adaptive_trailing_act_atr: float | None = None
+    adaptive_trailing_dist_atr: float | None = None
 
 
 @dataclass
@@ -111,7 +116,11 @@ class BotState:
         # Restore active trade
         at = data.get("active_trade")
         if at and isinstance(at, dict):
-            state.active_trade = ActiveTrade(**at)
+            # Filter out keys unknown to ActiveTrade (forward compat)
+            import dataclasses
+            valid_keys = {f.name for f in dataclasses.fields(ActiveTrade)}
+            filtered = {k: v for k, v in at.items() if k in valid_keys}
+            state.active_trade = ActiveTrade(**filtered)
         # Restore daily stats
         ds = data.get("daily_stats")
         if ds and isinstance(ds, dict):

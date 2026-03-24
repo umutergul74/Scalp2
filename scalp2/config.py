@@ -249,6 +249,17 @@ class PositionSizingConfig:
 
 
 @dataclass
+class AdaptiveTPSLConfig:
+    enabled: bool = False
+    high_vol_pctile: float = 0.80
+    low_vol_pctile: float = 0.30
+    high_vol_tp_scale: float = 1.3
+    high_vol_sl_scale: float = 1.2
+    low_vol_tp_scale: float = 0.7
+    low_vol_sl_scale: float = 0.8
+
+
+@dataclass
 class TradeManagementConfig:
     partial_tp_1_atr: float = 0.6
     partial_tp_1_pct: float = 0.5
@@ -256,6 +267,9 @@ class TradeManagementConfig:
     breakeven_trigger_atr: float = 0.6
     trailing_activation_atr: float = 0.8
     trailing_distance_atr: float = 0.5
+    adaptive_tp_sl: AdaptiveTPSLConfig = field(
+        default_factory=AdaptiveTPSLConfig
+    )
 
 
 @dataclass

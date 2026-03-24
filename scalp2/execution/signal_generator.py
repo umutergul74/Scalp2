@@ -36,6 +36,7 @@ class TradeSignal:
     timestamp: datetime
     probabilities: dict  # {short, hold, long}
     market_regime: str = ""  # actual market regime: bull/bear/choppy
+    adaptive_tp_sl: dict | None = None  # per-trade adaptive TP/SL overrides
 
 
 class SignalGenerator:
@@ -173,20 +174,24 @@ class SignalGenerator:
             )
             return self._no_trade(current_price, current_time, "low_confidence", market_regime=current_regime, probs=prob_dict)
 
-        # 9. Determine direction
+        # 9. Compute adaptive TP/SL multipliers
+        adaptive = self._compute_adaptive_tp_sl(atr_percentile, exec_cfg)
+        full_tp_atr = adaptive.get("adaptive_full_tp_atr", exec_cfg.trade_management.full_tp_atr)
+
+        # 10. Determine direction
         if probs[2] > probs[0]:
             direction = Direction.LONG
             confidence = float(probs[2])
-            tp = current_price + exec_cfg.trade_management.full_tp_atr * current_atr
+            tp = current_price + full_tp_atr * current_atr
             sl = current_price - self.config.labeling.sl_multiplier * current_atr
         else:
             direction = Direction.SHORT
             confidence = float(probs[0])
-            tp = current_price - exec_cfg.trade_management.full_tp_atr * current_atr
+            tp = current_price - full_tp_atr * current_atr
             sl = current_price + self.config.labeling.sl_multiplier * current_atr
 
-        # 10. Position sizing (fractional Kelly)
-        position_size = self._kelly_size(confidence, exec_cfg)
+        # 11. Position sizing (fractional Kelly)
+        position_size = self._kelly_size(confidence, exec_cfg, adaptive)
 
         self.daily_trade_count += 1
 
@@ -201,26 +206,51 @@ class SignalGenerator:
             timestamp=current_time,
             probabilities=prob_dict,
             market_regime=current_regime,
+            adaptive_tp_sl=adaptive if adaptive else None,
         )
 
         logger.info(
-            "SIGNAL: %s @ %.2f | conf=%.3f | TP=%.2f SL=%.2f | size=%.4f | regime=%s",
+            "SIGNAL: %s @ %.2f | conf=%.3f | TP=%.2f SL=%.2f | size=%.4f | regime=%s%s",
             direction.value, current_price, confidence, tp, sl,
             position_size, current_regime,
+            f" | adaptive(tp={full_tp_atr:.2f})" if adaptive else "",
         )
 
         return signal
 
-    def _kelly_size(self, confidence: float, exec_cfg) -> float:
+    def _compute_adaptive_tp_sl(self, atr_percentile: float, exec_cfg) -> dict:
+        """Compute adaptive TP/SL multipliers based on ATR percentile."""
+        cfg = exec_cfg.trade_management.adaptive_tp_sl
+        if not cfg.enabled:
+            return {}
+
+        tm = exec_cfg.trade_management
+        tp_scale = sl_scale = 1.0
+
+        if atr_percentile > cfg.high_vol_pctile:
+            tp_scale = cfg.high_vol_tp_scale
+            sl_scale = cfg.high_vol_sl_scale
+        elif atr_percentile < cfg.low_vol_pctile:
+            tp_scale = cfg.low_vol_tp_scale
+            sl_scale = cfg.low_vol_sl_scale
+
+        return {
+            "adaptive_partial_tp_atr": tm.partial_tp_1_atr * tp_scale,
+            "adaptive_full_tp_atr": tm.full_tp_atr * tp_scale,
+            "adaptive_trailing_act_atr": tm.trailing_activation_atr * tp_scale,
+            "adaptive_trailing_dist_atr": tm.trailing_distance_atr * sl_scale,
+        }
+
+    def _kelly_size(self, confidence: float, exec_cfg, adaptive: dict | None = None) -> float:
         """Fractional Kelly criterion position sizing.
 
         f = (p*b - q) / b, capped at max_fraction.
         b = effective TP/SL ratio accounting for partial TP exits.
         """
         tm = exec_cfg.trade_management
-        partial_pct = tm.partial_tp_1_pct      # 0.5
-        partial_atr = tm.partial_tp_1_atr      # 0.6
-        full_atr = tm.full_tp_atr              # 1.2
+        partial_pct = tm.partial_tp_1_pct
+        partial_atr = (adaptive or {}).get("adaptive_partial_tp_atr", tm.partial_tp_1_atr)
+        full_atr = (adaptive or {}).get("adaptive_full_tp_atr", tm.full_tp_atr)
         effective_tp = partial_pct * partial_atr + (1 - partial_pct) * full_atr
         b = effective_tp / self.config.labeling.sl_multiplier
         p = confidence
