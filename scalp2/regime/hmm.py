@@ -296,10 +296,11 @@ class RegimeDetector:
         init_weight = float(self.config.online_min_samples)
 
         # Seed sufficient stats from trained model parameters
+        internal_covars = getattr(self.model, "_covars_", self.model.covars_)
         self._online_stats = _OnlineStats(
             N=np.full(n_states, init_weight / n_states),
             S=self.model.means_.copy() * (init_weight / n_states),
-            SS=(self.model.covars_.copy() + self.model.means_ ** 2)
+            SS=(internal_covars.copy() + self.model.means_ ** 2)
             * (init_weight / n_states),
             trans_counts=self.model.transmat_.copy() * init_weight,
             feat_mean=self._mean.copy(),
