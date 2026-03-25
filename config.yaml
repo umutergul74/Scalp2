@@ -179,7 +179,7 @@ execution:
     trailing_activation_atr: 1.2
     trailing_distance_atr: 0.6
     adaptive_tp_sl:
-      enabled: false
+      enabled: true
       high_vol_pctile: 0.80
       low_vol_pctile: 0.30
       high_vol_tp_scale: 1.3
