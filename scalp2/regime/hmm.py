@@ -410,7 +410,16 @@ class RegimeDetector:
 
         # Smooth blend: 30% new + 70% old
         self.model.means_ = (1 - blend) * self.model.means_ + blend * new_means
-        self.model.covars_ = (1 - blend) * self.model.covars_ + blend * new_covars
+
+        # Use internal _covars_ to bypass hmmlearn property setter validation
+        old_covars = getattr(self.model, "_covars_", self.model.covars_)
+        blended_covars = (1 - blend) * old_covars + blend * new_covars
+        blended_covars = np.maximum(blended_covars, self.model.min_covar)
+        if hasattr(self.model, "_covars_"):
+            self.model._covars_ = blended_covars
+        else:
+            self.model.covars_ = blended_covars
+
         self.model.transmat_ = (
             (1 - blend) * self.model.transmat_ + blend * new_transmat
         )
