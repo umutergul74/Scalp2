@@ -44,15 +44,16 @@ class SignalGenerator:
 
     Pipeline:
         1. Check daily trade limit
-        2. Check regime — halt if choppy
-        3. Check ADX — skip if no trend
-        4. Check ATR percentile — skip low volatility
-        5. Extract latent from HybridEncoder
-        6. Build meta-features
-        7. Predict via XGBoost meta-learner
-        8. Apply confidence threshold
-        9. Determine direction & TP/SL
-       10. Compute position size (fractional Kelly)
+        2. Check regime — halt if choppy (ADX override)
+        3. Check time-of-day filter
+        4. Check ADX — skip if no trend
+        5. Check ATR percentile — skip low volatility
+        6. Extract latent + predict via XGBoost
+        7. Apply confidence threshold
+        8. Regime-direction filter (no SHORT in bull, no LONG in bear)
+        9. Compute adaptive TP/SL
+       10. Determine direction & TP/SL
+       11. Compute position size (fractional Kelly)
     """
 
     def __init__(
@@ -140,7 +141,7 @@ class SignalGenerator:
         is_choppy = regime_probs[-1, RegimeDetector.CHOPPY] > self.config.regime.choppy_threshold
         if is_choppy and current_adx < exec_cfg.choppy_adx_override:
             logger.info("Choppy regime detected (P=%.3f), skipping", regime_probs[-1, 2])
-            return self._no_trade(current_price, current_time, f"choppy_{current_regime}", market_regime=current_regime, probs=prob_dict)
+            return self._no_trade(current_price, current_time, "choppy", market_regime=current_regime, probs=prob_dict)
         if is_choppy:
             logger.info(
                 "Choppy override: ADX=%.1f >= %.1f, proceeding despite P(choppy)=%.3f",
@@ -174,11 +175,23 @@ class SignalGenerator:
             )
             return self._no_trade(current_price, current_time, "low_confidence", market_regime=current_regime, probs=prob_dict)
 
-        # 9. Compute adaptive TP/SL multipliers
+        # 9. Regime-direction filter: block SHORT in bull, LONG in bear
+        if exec_cfg.regime_direction_filter:
+            intended_dir = "LONG" if probs[2] > probs[0] else "SHORT"
+            if current_regime == "bull" and intended_dir == "SHORT":
+                logger.info("Regime-direction mismatch: SHORT blocked in bull regime")
+                return self._no_trade(current_price, current_time, "regime_direction",
+                                      market_regime=current_regime, probs=prob_dict)
+            if current_regime == "bear" and intended_dir == "LONG":
+                logger.info("Regime-direction mismatch: LONG blocked in bear regime")
+                return self._no_trade(current_price, current_time, "regime_direction",
+                                      market_regime=current_regime, probs=prob_dict)
+
+        # 10. Compute adaptive TP/SL multipliers
         adaptive = self._compute_adaptive_tp_sl(atr_percentile, exec_cfg)
         full_tp_atr = adaptive.get("adaptive_full_tp_atr", exec_cfg.trade_management.full_tp_atr)
 
-        # 10. Determine direction
+        # 11. Determine direction
         if probs[2] > probs[0]:
             direction = Direction.LONG
             confidence = float(probs[2])
@@ -190,7 +203,7 @@ class SignalGenerator:
             tp = current_price - full_tp_atr * current_atr
             sl = current_price + self.config.labeling.sl_multiplier * current_atr
 
-        # 11. Position sizing (fractional Kelly)
+        # 12. Position sizing (fractional Kelly)
         position_size = self._kelly_size(confidence, exec_cfg, adaptive)
 
         self.daily_trade_count += 1

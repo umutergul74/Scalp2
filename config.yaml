@@ -152,11 +152,12 @@ execution:
     enabled: true
     blocked_hours_utc: [3, 4]
 
-  confidence_threshold: 0.55
+  confidence_threshold: 0.58
   max_trades_per_day: 12
   min_adx: 25
   min_atr_percentile: 0.05
   choppy_adx_override: 35
+  regime_direction_filter: true
 
   order_execution:
     order_type: "limit"
