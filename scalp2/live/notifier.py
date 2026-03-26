@@ -186,6 +186,28 @@ class TelegramNotifier:
         )
         await self._send(msg)
 
+    async def trade_status(
+        self,
+        trade,
+        current_price: float,
+        unrealized_pct: float,
+        atr_move: float,
+    ) -> None:
+        """Send periodic trade status update during active trade."""
+        direction_emoji = "🟢" if trade.direction == "LONG" else "🔴"
+        pnl_emoji = "📈" if unrealized_pct > 0 else "📉"
+
+        msg = (
+            f"{direction_emoji} <b>Trade Durumu — Bar {trade.bars_held}</b>\n"
+            f"Yön    : <code>{trade.direction}</code>\n"
+            f"Giriş  : <code>${trade.entry_price:,.1f}</code>\n"
+            f"Şimdi  : <code>${current_price:,.1f}</code>\n"
+            f"SL     : <code>${trade.stop_loss:,.1f}</code>\n"
+            f"PnL    : {pnl_emoji} <code>{unrealized_pct*100:+.2f}%</code> ({atr_move:.2f} ATR)\n"
+            f"TP1    : {'✅' if trade.partial_tp_done else '⏳'}"
+        )
+        await self._send(msg)
+
     async def error(self, message: str) -> None:
         await self._send(f"🚨 <b>HATA</b>\n<code>{message[:500]}</code>")
 

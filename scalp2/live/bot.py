@@ -378,13 +378,66 @@ class LiveBot:
             take_profit=signal.take_profit,
         )
 
+        # Paper mode: simulate slippage (adverse direction)
+        filled_price = result["filled_price"]
+        if self.paper_mode:
+            slippage_bps = self.config.execution.order_execution.slippage_bps
+            if direction == "LONG":
+                filled_price *= (1 + slippage_bps / 10000)
+            else:
+                filled_price *= (1 - slippage_bps / 10000)
+
+        # Recalculate SL/TP from actual fill price
+        if abs(filled_price - signal.entry_price) > 0.01:
+            sl_dist = abs(signal.entry_price - signal.stop_loss)
+            tp_dist = abs(signal.entry_price - signal.take_profit)
+            if direction == "LONG":
+                actual_sl = filled_price - sl_dist
+                actual_tp = filled_price + tp_dist
+            else:
+                actual_sl = filled_price + sl_dist
+                actual_tp = filled_price - tp_dist
+            logger.info(
+                "Fill price $%.1f differs from signal $%.1f — SL/TP recalculated",
+                filled_price, signal.entry_price,
+            )
+        else:
+            actual_sl = signal.stop_loss
+            actual_tp = signal.take_profit
+
+        # Live mode: update exchange SL AND TP if fill price differs
+        if not self.paper_mode and abs(filled_price - signal.entry_price) > 0.01:
+            amount = size_usd / filled_price
+            try:
+                new_sl_id = await self.executor.modify_stop_loss(
+                    old_sl_order_id=result["sl_order_id"],
+                    direction=direction,
+                    amount=amount,
+                    new_sl_price=actual_sl,
+                )
+                result["sl_order_id"] = new_sl_id
+                logger.info("Exchange SL updated to $%.1f after fill adjustment", actual_sl)
+            except Exception as e:
+                logger.warning("Failed to update SL after fill: %s", e)
+            try:
+                new_tp_id = await self.executor.modify_take_profit(
+                    old_tp_order_id=result["tp_order_id"],
+                    direction=direction,
+                    amount=amount,
+                    new_tp_price=actual_tp,
+                )
+                result["tp_order_id"] = new_tp_id
+                logger.info("Exchange TP updated to $%.1f after fill adjustment", actual_tp)
+            except Exception as e:
+                logger.warning("Failed to update TP after fill: %s", e)
+
         # Record active trade in state
         adaptive = signal.adaptive_tp_sl or {}
         self.state.active_trade = ActiveTrade(
             direction=direction,
-            entry_price=result["filled_price"],
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit,
+            entry_price=filled_price,
+            stop_loss=actual_sl,
+            take_profit=actual_tp,
             atr_at_entry=current_atr,
             position_size_usd=size_usd,
             position_size_frac=signal.position_size,
@@ -403,9 +456,9 @@ class LiveBot:
         # Telegram alert (async)
         await self.notifier.trade_opened(
             direction=direction,
-            entry=result["filled_price"],
-            sl=signal.stop_loss,
-            tp=signal.take_profit,
+            entry=filled_price,
+            sl=actual_sl,
+            tp=actual_tp,
             size_usd=size_usd,
             confidence=signal.confidence,
             regime=signal.market_regime,
@@ -422,22 +475,30 @@ class LiveBot:
 
         trade.bars_held += 1
 
-        # Get current price
-        try:
-            price = await self.executor.get_ticker_price()
-        except Exception as e:
-            logger.warning("Failed to get price: %s", e)
-            return
-
         is_long = trade.direction == "LONG"
         atr = trade.atr_at_entry
         tm = self.config.execution.trade_management
 
-        # Check if exchange already closed the position (SL/TP hit)
-        if not self.paper_mode:
+        # Get current price (paper: use last candle close to save an API call)
+        if self.paper_mode:
+            try:
+                last_candle = await self.executor.fetch_last_candle()
+                price = last_candle["close"]
+                candle_high = last_candle["high"]
+                candle_low = last_candle["low"]
+            except Exception as e:
+                logger.warning("Failed to get candle: %s", e)
+                return
+        else:
+            try:
+                price = await self.executor.get_ticker_price()
+            except Exception as e:
+                logger.warning("Failed to get price: %s", e)
+                return
+
+            # Check if exchange already closed the position (SL/TP hit)
             pos = await self.executor.get_open_position()
             if pos is None:
-                # Position closed by exchange (SL or TP hit)
                 logger.info("Position closed by exchange")
                 await self._finalize_trade(price, "exchange_close")
                 return
@@ -450,20 +511,30 @@ class LiveBot:
 
         atr_move = unrealized_pct * trade.entry_price / (atr + 1e-10)
 
-        # Paper mode: simulate SL hit
+        # Paper mode: compute favorable excursion from candle high/low
+        favorable_atr_move = atr_move
         if self.paper_mode:
-            if is_long and price <= trade.stop_loss:
+
+            # Favorable excursion (matches backtester: uses high/low)
+            if is_long:
+                favorable_pct = (candle_high - trade.entry_price) / trade.entry_price
+            else:
+                favorable_pct = (trade.entry_price - candle_low) / trade.entry_price
+            favorable_atr_move = favorable_pct * trade.entry_price / (atr + 1e-10)
+
+            # SL check using candle high/low (not just ticker price)
+            if is_long and candle_low <= trade.stop_loss:
                 sl_pnl = (trade.stop_loss - trade.entry_price) / trade.entry_price
                 await self._finalize_trade(trade.stop_loss, "SL", sl_pnl)
                 return
-            if not is_long and price >= trade.stop_loss:
+            if not is_long and candle_high >= trade.stop_loss:
                 sl_pnl = (trade.entry_price - trade.stop_loss) / trade.entry_price
                 await self._finalize_trade(trade.stop_loss, "SL", sl_pnl)
                 return
 
-        # Partial TP check
+        # Partial TP check (use favorable excursion for intra-candle detection)
         partial_tp_threshold = trade.adaptive_partial_tp_atr or tm.partial_tp_1_atr
-        if not trade.partial_tp_done and atr_move >= partial_tp_threshold:
+        if not trade.partial_tp_done and favorable_atr_move >= partial_tp_threshold:
             logger.info("TP1 hit (%.2f ATR), closing 50%%", atr_move)
             amount = trade.position_size_usd / trade.entry_price
             await self.executor.close_partial(trade.direction, tm.partial_tp_1_pct, amount)
@@ -482,15 +553,18 @@ class LiveBot:
             self.state.save(self.state_dir)
             await self.notifier.info(f"TP1 hit — 50% kapatıldı, SL → breakeven (${trade.entry_price:,.1f})")
 
-        # Full TP check (paper mode)
+        # Full TP check (paper mode — uses favorable excursion)
         full_tp_threshold = trade.adaptive_full_tp_atr or tm.full_tp_atr
-        if self.paper_mode and atr_move >= full_tp_threshold:
-            await self._finalize_trade(price, "TP", unrealized_pct)
+        if self.paper_mode and favorable_atr_move >= full_tp_threshold:
+            # Exit at TP price, not close (matches real exchange behavior)
+            tp_exit = trade.take_profit if trade.take_profit > 0 else price
+            tp_pnl = abs(tp_exit - trade.entry_price) / trade.entry_price
+            await self._finalize_trade(tp_exit, "TP", tp_pnl)
             return
 
-        # Trailing stop
+        # Trailing stop (use favorable excursion for activation check)
         trailing_act = trade.adaptive_trailing_act_atr or tm.trailing_activation_atr
-        if atr_move >= trailing_act:
+        if favorable_atr_move >= trailing_act:
             trail_dist = (trade.adaptive_trailing_dist_atr or tm.trailing_distance_atr) * atr
             if is_long:
                 new_sl = price - trail_dist
@@ -518,6 +592,15 @@ class LiveBot:
                 await self.executor.cancel_all_orders()
                 await self.executor.close_position(trade.direction)
             await self._finalize_trade(price, "TIME", unrealized_pct)
+            return
+
+        # Send periodic trade status update via Telegram
+        await self.notifier.trade_status(
+            trade=trade,
+            current_price=price,
+            unrealized_pct=unrealized_pct,
+            atr_move=atr_move,
+        )
 
     async def _finalize_trade(self, exit_price: float, reason: str, pnl_pct: float | None = None) -> None:
         """Record trade completion and clear state."""

@@ -116,6 +116,17 @@ class BinanceExecutor:
         ticker = await self._retry(lambda: self.exchange.fetch_ticker(self.symbol))
         return float(ticker["last"])
 
+    async def fetch_last_candle(self, timeframe: str = "15m") -> dict:
+        """Fetch the last completed candle's OHLC for realistic paper SL/TP checks."""
+        ohlcv = await self._retry(
+            lambda: self.exchange.fetch_ohlcv(self.symbol, timeframe, limit=2)
+        )
+        if len(ohlcv) < 2:
+            raise ValueError(f"Expected >= 2 candles, got {len(ohlcv)}")
+        # ohlcv[-2] = last completed candle, ohlcv[-1] = current (incomplete)
+        candle = ohlcv[-2]
+        return {"open": candle[1], "high": candle[2], "low": candle[3], "close": candle[4]}
+
     # ── Order Execution ───────────────────────────────────────────────────
 
     async def open_position(
@@ -261,6 +272,38 @@ class BinanceExecutor:
         )
         logger.info("New SL placed: $%.1f (id=%s)", new_sl_price, new_sl["id"])
         return new_sl["id"]
+
+    async def modify_take_profit(
+        self,
+        old_tp_order_id: str,
+        direction: str,
+        amount: float,
+        new_tp_price: float,
+    ) -> str:
+        """Cancel old TP and place new one (for fill-price adjustment)."""
+        if self.paper_mode:
+            logger.info("[PAPER] TP moved to $%.1f", new_tp_price)
+            return f"paper_tp_{int(time.time())}"
+
+        # Cancel old TP
+        try:
+            await self._retry(lambda: self.exchange.cancel_order(old_tp_order_id, self.symbol))
+        except Exception as e:
+            logger.warning("Failed to cancel old TP %s: %s", old_tp_order_id, e)
+
+        # Place new TP
+        close_side = "sell" if direction == "LONG" else "buy"
+        new_tp = await self._retry(
+            lambda: self.exchange.create_order(
+                symbol=self.symbol,
+                type="take_profit_market",
+                side=close_side,
+                amount=amount,
+                params={"stopPrice": new_tp_price, "closePosition": False},
+            )
+        )
+        logger.info("New TP placed: $%.1f (id=%s)", new_tp_price, new_tp["id"])
+        return new_tp["id"]
 
     async def cancel_all_orders(self) -> None:
         """Cancel all open orders for the symbol."""
