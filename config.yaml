@@ -137,10 +137,10 @@ training:
   scaler: "robust"
 
 regime:
-  version: "v1"
+  version: "v2"
   n_states: 3
-  features: ["log_return", "gk_vol_14", "volume_zscore"]
-  covariance_type: "diag"
+  features: ["log_return", "gk_vol_14", "atr_pct", "adx", "rsi_14"]
+  covariance_type: "full"
   n_iter: 100
   choppy_threshold: 0.55
   online_update_enabled: true
