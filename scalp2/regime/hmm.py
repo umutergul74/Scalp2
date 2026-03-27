@@ -18,13 +18,14 @@ class _OnlineStats:
 
     N: np.ndarray  # (n_states,) weighted counts per state
     S: np.ndarray  # (n_states, n_features) weighted feature sums
-    SS: np.ndarray  # (n_states, n_features) weighted feature sum-of-squares
+    SS: np.ndarray  # (n_states, n_features) weighted feature sum-of-squares (diag)
     trans_counts: np.ndarray  # (n_states, n_states) transition counts
     feat_mean: np.ndarray  # (n_features,) running feature mean
     feat_var: np.ndarray  # (n_features,) running feature variance
     feat_count: float  # effective sample count for EMA
     total_bars_seen: int = 0
     bars_since_update: int = 0
+    SX: np.ndarray | None = None  # (n_states, n_features, n_features) outer product sums (full cov)
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,11 @@ def _logsumexp_1d(a: np.ndarray) -> float:
 class RegimeDetector:
     """3-state Gaussian HMM for market regime detection.
 
-    Fitted on [log_return, GK_volatility, volume_zscore].
-    States are mapped post-hoc by sorting on mean return:
-        - Highest mean return → Bull
-        - Lowest mean return  → Bear
-        - Middle (highest variance) → Choppy
+    Two versions:
+        v1: 3 features [log_return, gk_vol_14, volume_zscore], diag covariance.
+            States mapped by sorting on mean return.
+        v2: 5 features [log_return, gk_vol_14, atr_pct, adx, rsi_14], full covariance.
+            Choppy = lowest ADX mean, then Bull/Bear by return.
 
     Usage:
         detector = RegimeDetector(config)
@@ -59,6 +60,7 @@ class RegimeDetector:
 
     def __init__(self, config: RegimeConfig):
         self.config = config
+        self.version = getattr(config, "version", "v1")
         self.model = GaussianHMM(
             n_components=config.n_states,
             covariance_type=config.covariance_type,
@@ -119,31 +121,27 @@ class RegimeDetector:
 
         self._fallback = False
 
-        # Map states by mean return (first feature = log_return)
-        means = self.model.means_[:, 0]
-        sorted_idx = np.argsort(means)
-
-        # sorted_idx[0] = lowest return → Bear
-        # sorted_idx[-1] = highest return → Bull
-        # sorted_idx[1] (middle) → Choppy
-        self.state_map = {
-            int(sorted_idx[0]): self.BEAR,
-            int(sorted_idx[-1]): self.BULL,
-            int(sorted_idx[1]): self.CHOPPY,
-        }
+        # Map states to regime labels
+        if self.version == "v2":
+            self.state_map = self._map_states_v2()
+        else:
+            self.state_map = self._map_states_v1()
 
         logger.info(
-            "HMM state mapping: %s",
+            "HMM %s state mapping: %s",
+            self.version,
             {
                 hmm_state: self.STATE_NAMES[regime_idx]
                 for hmm_state, regime_idx in self.state_map.items()
             },
         )
+        means = self.model.means_[:, 0]
+        inv_map = {v: k for k, v in self.state_map.items()}
         logger.info(
             "State means (return): Bull=%.6f, Bear=%.6f, Choppy=%.6f",
-            means[sorted_idx[-1]],
-            means[sorted_idx[0]],
-            means[sorted_idx[1]],
+            means[inv_map[self.BULL]],
+            means[inv_map[self.BEAR]],
+            means[inv_map[self.CHOPPY]],
         )
 
         self._fitted = True
@@ -217,6 +215,55 @@ class RegimeDetector:
         for hmm_state, regime_idx in self.state_map.items():
             reordered[:, regime_idx] = posteriors[:, hmm_state]
         return reordered
+
+    def _map_states_v1(self) -> dict[int, int]:
+        """Map states by sorting on mean return (original method)."""
+        means = self.model.means_[:, 0]
+        sorted_idx = np.argsort(means)
+        return {
+            int(sorted_idx[0]): self.BEAR,
+            int(sorted_idx[-1]): self.BULL,
+            int(sorted_idx[1]): self.CHOPPY,
+        }
+
+    def _map_states_v2(self) -> dict[int, int]:
+        """Map states using ADX for choppy, return for bull/bear.
+
+        v2 uses ADX (trend strength) to identify the choppy state directly,
+        rather than assuming choppy = middle return. This is more robust
+        because choppy markets can have any return direction.
+        """
+        means = self.model.means_
+
+        # Find ADX feature index in configured feature list
+        try:
+            adx_idx = self.feature_names.index("adx")
+        except ValueError:
+            logger.warning("ADX not in regime features, falling back to v1 mapping")
+            return self._map_states_v1()
+
+        # Choppy = lowest ADX mean (weakest trend)
+        adx_means = means[:, adx_idx]
+        choppy_state = int(np.argmin(adx_means))
+
+        # Remaining 2 states: higher return mean = Bull, lower = Bear
+        remaining = [s for s in range(self.config.n_states) if s != choppy_state]
+        ret_idx = 0  # log_return is always first feature
+        if means[remaining[0], ret_idx] > means[remaining[1], ret_idx]:
+            bull_state, bear_state = remaining[0], remaining[1]
+        else:
+            bull_state, bear_state = remaining[1], remaining[0]
+
+        logger.info(
+            "v2 mapping: ADX means=[%.2f, %.2f, %.2f], choppy=state%d (ADX=%.2f)",
+            *adx_means, choppy_state, adx_means[choppy_state],
+        )
+
+        return {
+            int(bull_state): self.BULL,
+            int(bear_state): self.BEAR,
+            int(choppy_state): self.CHOPPY,
+        }
 
     def predict_proba_online(self, df: pd.DataFrame) -> np.ndarray:
         """Forward-only regime probabilities (no look-ahead bias).
@@ -297,16 +344,32 @@ class RegimeDetector:
 
         # Seed sufficient stats from trained model parameters
         internal_covars = getattr(self.model, "_covars_", self.model.covars_)
+        w = init_weight / n_states
+
         self._online_stats = _OnlineStats(
-            N=np.full(n_states, init_weight / n_states),
-            S=self.model.means_.copy() * (init_weight / n_states),
-            SS=(internal_covars.copy() + self.model.means_ ** 2)
-            * (init_weight / n_states),
+            N=np.full(n_states, w),
+            S=self.model.means_.copy() * w,
+            SS=(internal_covars.copy() + self.model.means_ ** 2) * w
+            if self.config.covariance_type == "diag"
+            else np.zeros((n_states, len(self.feature_names))),  # unused for full
             trans_counts=self.model.transmat_.copy() * init_weight,
             feat_mean=self._mean.copy(),
             feat_var=(self._std**2).copy(),
             feat_count=init_weight,
         )
+
+        # Full covariance: track outer product sums E[x x^T]
+        if self.config.covariance_type == "full":
+            means = self.model.means_
+            self._online_stats.SX = (
+                internal_covars.copy()
+                + np.einsum("ij,ik->ijk", means, means)
+            ) * w
+        else:
+            # Diagonal: SS is sufficient, keep SS init from above
+            self._online_stats.SS = (
+                internal_covars.copy() + self.model.means_ ** 2
+            ) * w
 
     def update_online(self, df: pd.DataFrame) -> bool:
         """Update HMM parameters with new data using exponential decay.
@@ -357,6 +420,8 @@ class RegimeDetector:
         stats.S *= batch_decay
         stats.SS *= batch_decay
         stats.trans_counts *= batch_decay
+        if stats.SX is not None:
+            stats.SX *= batch_decay
 
         for t in range(n_new):
             g = gamma[t]
@@ -364,6 +429,8 @@ class RegimeDetector:
             stats.N += g
             stats.S += g[:, None] * x[None, :]
             stats.SS += g[:, None] * (x[None, :] ** 2)
+            if stats.SX is not None:
+                stats.SX += g[:, None, None] * np.outer(x, x)[None, :, :]
 
             if t > 0:
                 stats.trans_counts += np.outer(gamma[t - 1], gamma[t])
@@ -395,15 +462,32 @@ class RegimeDetector:
     def _reestimate_from_stats(self) -> None:
         """Re-estimate HMM parameters from accumulated sufficient statistics."""
         stats = self._online_stats
+        n_states = self.config.n_states
         eps = 1e-3
         blend = 0.3
 
         # Emission means
         new_means = stats.S / (stats.N[:, None] + eps)
 
-        # Emission covariances (diagonal)
-        new_covars = stats.SS / (stats.N[:, None] + eps) - new_means**2
-        new_covars = np.maximum(new_covars, self.model.min_covar)
+        # Emission covariances
+        if stats.SX is not None:
+            # Full covariance: Cov = E[xx'] - E[x]E[x]'
+            new_covars = (
+                stats.SX / (stats.N[:, None, None] + eps)
+                - np.einsum("ij,ik->ijk", new_means, new_means)
+            )
+            # Regularize: ensure positive semi-definite
+            for s in range(n_states):
+                # Symmetrize (numerical safety)
+                new_covars[s] = 0.5 * (new_covars[s] + new_covars[s].T)
+                # Floor diagonal to min_covar
+                diag = np.diag(new_covars[s]).copy()
+                diag = np.maximum(diag, self.model.min_covar)
+                np.fill_diagonal(new_covars[s], diag)
+        else:
+            # Diagonal covariance
+            new_covars = stats.SS / (stats.N[:, None] + eps) - new_means**2
+            new_covars = np.maximum(new_covars, self.model.min_covar)
 
         # Transition matrix
         row_sums = stats.trans_counts.sum(axis=1, keepdims=True) + eps
@@ -415,7 +499,15 @@ class RegimeDetector:
         # Use internal _covars_ to bypass hmmlearn property setter validation
         old_covars = getattr(self.model, "_covars_", self.model.covars_)
         blended_covars = (1 - blend) * old_covars + blend * new_covars
-        blended_covars = np.maximum(blended_covars, self.model.min_covar)
+        if stats.SX is not None:
+            # Full: regularize blended result
+            for s in range(n_states):
+                blended_covars[s] = 0.5 * (blended_covars[s] + blended_covars[s].T)
+                diag = np.diag(blended_covars[s]).copy()
+                diag = np.maximum(diag, self.model.min_covar)
+                np.fill_diagonal(blended_covars[s], diag)
+        else:
+            blended_covars = np.maximum(blended_covars, self.model.min_covar)
         if hasattr(self.model, "_covars_"):
             self.model._covars_ = blended_covars
         else:
@@ -448,7 +540,7 @@ class RegimeDetector:
         if not hasattr(self, "_online_stats"):
             return None
         s = self._online_stats
-        return {
+        d = {
             "N": s.N.tolist(),
             "S": s.S.tolist(),
             "SS": s.SS.tolist(),
@@ -459,6 +551,9 @@ class RegimeDetector:
             "total_bars_seen": s.total_bars_seen,
             "bars_since_update": s.bars_since_update,
         }
+        if s.SX is not None:
+            d["SX"] = s.SX.tolist()
+        return d
 
     def set_online_stats_dict(self, data: dict) -> None:
         """Restore online stats from a saved dict."""
@@ -472,4 +567,5 @@ class RegimeDetector:
             feat_count=data["feat_count"],
             total_bars_seen=data["total_bars_seen"],
             bars_since_update=data["bars_since_update"],
+            SX=np.array(data["SX"]) if "SX" in data else None,
         )

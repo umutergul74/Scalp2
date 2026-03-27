@@ -137,6 +137,7 @@ training:
   scaler: "robust"
 
 regime:
+  version: "v1"
   n_states: 3
   features: ["log_return", "gk_vol_14", "volume_zscore"]
   covariance_type: "diag"

@@ -223,6 +223,7 @@ class TrainingConfig:
 
 @dataclass
 class RegimeConfig:
+    version: str = "v1"  # "v1" (3-feature diag) or "v2" (5-feature full cov)
     n_states: int = 3
     features: List[str] = field(
         default_factory=lambda: ["log_return", "gk_vol_14", "volume_zscore"]
