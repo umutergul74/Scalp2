@@ -105,10 +105,14 @@ class DataPipeline:
             current_adx = float(last_row.get("adx", 999.0)) if "adx" in df_full.columns else 999.0
             current_price = float(last_row["close"])
 
-            # ATR percentile (rolling rank over 96 bars ≈ 24h)
+            # ATR percentile (rolling rank over 96 bars ≈ 24h — matches backtest)
             if atr_col in df_full.columns:
                 atr_series = df_full[atr_col]
-                atr_pctile = float(atr_series.rank(pct=True).iloc[-1])
+                atr_pctile = float(
+                    atr_series.rolling(96, min_periods=10).rank(pct=True).iloc[-1]
+                )
+                if np.isnan(atr_pctile):
+                    atr_pctile = 1.0
             else:
                 atr_pctile = 1.0
 
