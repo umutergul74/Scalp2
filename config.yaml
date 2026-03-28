@@ -188,6 +188,26 @@ execution:
       high_vol_sl_scale: 1.2
       low_vol_tp_scale: 0.7
       low_vol_sl_scale: 0.8
+    cooldown:
+      enabled: true
+      bars_after_sl: 4
+      bars_after_regime_close: 2
+    price_distance_block:
+      enabled: true
+      min_atr_distance: 0.5
+    consecutive_sl_cap:
+      enabled: true
+      max_consecutive: 3
+      reset_after_win: true
+
+  risk_limits:
+    daily_loss_limit_pct: 3.0
+    weekly_loss_limit_pct: 5.0
+    drawdown_halt_pct: 8.0
+    win_streak_reduction:
+      enabled: true
+      after_wins: 5
+      size_multiplier: 0.7
 
   slippage_model:
     base_bps: 2.0

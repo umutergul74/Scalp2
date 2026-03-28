@@ -44,6 +44,8 @@ import torch
 
 from scalp2.config import load_config
 from scalp2.execution.signal_generator import SignalGenerator, Direction
+from scalp2.execution.trade_manager import TradeManager, TradeStatus
+from scalp2.execution.risk_manager import RiskManager
 from scalp2.models.hybrid import HybridEncoder
 from scalp2.models.meta_learner import XGBoostMetaLearner
 from scalp2.utils.serialization import load_fold_artifacts
@@ -103,7 +105,16 @@ class LiveBot:
         # Load model artifacts
         self._load_model(fold_idx)
 
-        # Signal generator (reuses existing module)
+        # Trade manager (Enhancement 1: SL protection)
+        self.trade_manager = TradeManager(
+            config=self.config.execution.trade_management,
+            max_holding_bars=self.config.labeling.max_holding_bars,
+        )
+
+        # Risk manager (Enhancement 5: Portfolio-level risk)
+        self.risk_manager = RiskManager(config=self.config.execution)
+
+        # Signal generator (reuses existing module + new managers)
         self.signal_gen = SignalGenerator(
             config=self.config,
             model=self.encoder,
@@ -111,6 +122,8 @@ class LiveBot:
             regime_detector=self.regime_detector,
             scaler=self.scaler,
             top_feature_indices=self.top_indices,
+            trade_manager=self.trade_manager,
+            risk_manager=self.risk_manager,
         )
 
         # Data pipeline
@@ -129,6 +142,12 @@ class LiveBot:
         if self.config.regime.online_update_enabled and self.regime_detector is not None:
             self._load_regime_stats()
 
+        # Restore trade manager protection state
+        self._load_protection_state()
+
+        # Restore risk manager state
+        self._load_risk_state()
+
         # Shutdown flag
         self._running = True
 
@@ -140,6 +159,14 @@ class LiveBot:
                      self.config.execution.max_trades_per_day)
         logger.info("  Features: %d | Seq len: %d",
                      len(self.feature_names), self.config.model.seq_len)
+        logger.info("  SL Protection: cooldown=%s, price_block=%s, sl_cap=%s",
+                     self.config.execution.trade_management.cooldown.enabled,
+                     self.config.execution.trade_management.price_distance_block.enabled,
+                     self.config.execution.trade_management.consecutive_sl_cap.enabled)
+        logger.info("  Risk Limits: daily=%.1f%%, weekly=%.1f%%, dd_halt=%.1f%%",
+                     self.config.execution.risk_limits.daily_loss_limit_pct,
+                     self.config.execution.risk_limits.weekly_loss_limit_pct,
+                     self.config.execution.risk_limits.drawdown_halt_pct)
         logger.info("=" * 60)
 
     # ── Model Loading ─────────────────────────────────────────────────────
@@ -206,6 +233,9 @@ class LiveBot:
 
                     now = datetime.now(timezone.utc)
                     self.state.reset_daily_if_needed(now)
+
+                    # Advance trade manager bar counter
+                    self.trade_manager.advance_bar()
 
                     # Check if we have an active trade
                     if self.state.active_trade is not None:
@@ -350,6 +380,59 @@ class LiveBot:
             )
         except Exception as e:
             logger.warning("Failed to load regime stats: %s — starting fresh", e)
+
+    def _save_protection_state(self) -> None:
+        """Save trade manager SL protection state for crash recovery."""
+        path = self.state_dir / "protection_state.json"
+        try:
+            with open(path, "w") as f:
+                json.dump(self.trade_manager.get_protection_state(), f)
+        except Exception as e:
+            logger.warning("Failed to save protection state: %s", e)
+
+    def _load_protection_state(self) -> None:
+        """Restore trade manager SL protection state after restart."""
+        path = self.state_dir / "protection_state.json"
+        if not path.exists():
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.trade_manager.set_protection_state(data)
+            logger.info(
+                "Restored SL protection state (consecutive_sl=%d, current_bar=%d)",
+                data.get("consecutive_sl_count", 0),
+                data.get("current_bar", 0),
+            )
+        except Exception as e:
+            logger.warning("Failed to load protection state: %s — starting fresh", e)
+
+    def _save_risk_state(self) -> None:
+        """Save risk manager portfolio state for crash recovery."""
+        path = self.state_dir / "risk_state.json"
+        try:
+            with open(path, "w") as f:
+                json.dump(self.risk_manager.get_state_dict(), f)
+        except Exception as e:
+            logger.warning("Failed to save risk state: %s", e)
+
+    def _load_risk_state(self) -> None:
+        """Restore risk manager portfolio state after restart."""
+        path = self.state_dir / "risk_state.json"
+        if not path.exists():
+            return
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.risk_manager.set_state_dict(data)
+            logger.info(
+                "Restored risk state (cum_pnl=%.2f%%, peak=%.2f%%, halted=%s)",
+                data.get("cumulative_pnl_pct", 0),
+                data.get("peak_pnl_pct", 0),
+                data.get("halted", False),
+            )
+        except Exception as e:
+            logger.warning("Failed to load risk state: %s — starting fresh", e)
 
     async def _execute_signal(self, signal, current_atr: float) -> None:
         """Place orders on exchange for a trade signal."""
@@ -617,7 +700,31 @@ class LiveBot:
                 pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
 
         pnl_usd = pnl_pct * trade.position_size_usd * leverage
+        leveraged_pnl_pct = pnl_pct * leverage * 100  # % of equity
         self.state.record_trade(pnl_usd)
+
+        # Record in trade manager for SL protection (Enhancement 1)
+        trade_status = {
+            "SL": TradeStatus.CLOSED_SL,
+            "TP": TradeStatus.CLOSED_TP,
+            "TIME": TradeStatus.CLOSED_TIME,
+            "exchange_close": TradeStatus.CLOSED_SL,  # Assume SL if exchange closed
+        }.get(reason, TradeStatus.CLOSED_REGIME)
+        self.trade_manager.record_trade_result(
+            status=trade_status,
+            exit_price=exit_price,
+            direction=trade.direction,
+            atr=trade.atr_at_entry,
+        )
+        self._save_protection_state()
+
+        # Record in risk manager for portfolio limits (Enhancement 5)
+        now = datetime.now(timezone.utc)
+        self.risk_manager.record_trade(
+            timestamp=now,
+            pnl_pct=leveraged_pnl_pct,
+        )
+        self._save_risk_state()
 
         logger.info(
             "Trade closed: %s %s | entry=$%.1f exit=$%.1f | PnL=$%.2f (%.2f%%)",
@@ -720,6 +827,10 @@ class LiveBot:
         # Persist HMM online stats
         if self.config.regime.online_update_enabled and self.regime_detector is not None:
             self._save_regime_stats()
+
+        # Persist protection and risk state
+        self._save_protection_state()
+        self._save_risk_state()
 
         if self.state.active_trade is not None:
             logger.info(

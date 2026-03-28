@@ -1,10 +1,10 @@
-"""Risk management — daily limits, regime gating, exposure control."""
+"""Portfolio-level risk management — daily/weekly loss limits, drawdown halt, win streak control."""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from scalp2.config import ExecutionConfig
 
@@ -25,12 +25,15 @@ class DailyStats:
 
 
 class RiskManager:
-    """Gate trades based on risk rules and daily limits.
+    """Portfolio-level risk gating beyond individual trade management.
 
     Rules:
-        - Max N trades per day (default: 2)
+        - Max N trades per day
         - Halt during choppy regime
-        - Max daily loss limit
+        - Daily loss limit (% of equity)
+        - Weekly loss limit (% of equity)
+        - Max drawdown halt (% of peak equity)
+        - Win streak position size reduction (anti-overconfidence)
         - Track daily P&L
     """
 
@@ -38,6 +41,13 @@ class RiskManager:
         self.config = config
         self.daily_stats: dict[date, DailyStats] = {}
         self.current_date: date | None = None
+
+        # ── Enhancement 5: Portfolio-level tracking ──
+        self._cumulative_pnl_pct: float = 0.0  # Since bot start
+        self._peak_pnl_pct: float = 0.0
+        self._consecutive_wins: int = 0
+        self._halted: bool = False
+        self._halt_reason: str = ""
 
     def _get_today(self, timestamp: datetime) -> DailyStats:
         """Get or create today's stats."""
@@ -53,7 +63,7 @@ class RiskManager:
         choppy_prob: float = 0.0,
         choppy_threshold: float = 0.5,
     ) -> tuple[bool, str]:
-        """Check if a new trade is permitted.
+        """Check if a new trade is permitted by all risk rules.
 
         Args:
             timestamp: Current time.
@@ -63,41 +73,128 @@ class RiskManager:
         Returns:
             (allowed, reason) tuple.
         """
+        # 0. Check if system is halted
+        if self._halted:
+            return False, f"risk_halt ({self._halt_reason})"
+
         stats = self._get_today(timestamp)
 
-        # Check daily trade limit
+        # 1. Check daily trade limit
         if stats.trades_taken >= self.config.max_trades_per_day:
             return False, f"daily_limit ({stats.trades_taken}/{self.config.max_trades_per_day})"
 
-        # Check regime
+        # 2. Check regime
         if choppy_prob > choppy_threshold:
             return False, f"choppy_regime (P={choppy_prob:.3f})"
 
+        # 3. Check daily loss limit
+        risk_cfg = self.config.risk_limits
+        if abs(stats.total_pnl) > 0 and stats.total_pnl < 0:
+            daily_loss_pct = abs(stats.total_pnl)  # Already in pct from record_trade
+            if daily_loss_pct >= risk_cfg.daily_loss_limit_pct:
+                logger.warning(
+                    "Daily loss limit hit: %.2f%% >= %.2f%%",
+                    daily_loss_pct, risk_cfg.daily_loss_limit_pct,
+                )
+                return False, f"daily_loss_limit ({daily_loss_pct:.1f}%)"
+
+        # 4. Check weekly loss limit
+        weekly_pnl = self._get_weekly_pnl(timestamp)
+        if weekly_pnl < -risk_cfg.weekly_loss_limit_pct:
+            logger.warning(
+                "Weekly loss limit hit: %.2f%% >= %.2f%%",
+                abs(weekly_pnl), risk_cfg.weekly_loss_limit_pct,
+            )
+            return False, f"weekly_loss_limit ({weekly_pnl:.1f}%)"
+
+        # 5. Check drawdown halt
+        current_dd = self._peak_pnl_pct - self._cumulative_pnl_pct
+        if current_dd >= risk_cfg.drawdown_halt_pct:
+            self._halted = True
+            self._halt_reason = f"drawdown_{current_dd:.1f}%"
+            logger.critical(
+                "DRAWDOWN HALT: %.2f%% drawdown from peak — ALL trading stopped!",
+                current_dd,
+            )
+            return False, f"drawdown_halt ({current_dd:.1f}%)"
+
         return True, "approved"
 
-    def record_trade(self, timestamp: datetime, pnl: float) -> None:
-        """Record a completed trade."""
+    def get_position_size_modifier(self) -> float:
+        """Get position size multiplier based on win/loss streaks.
+
+        Returns:
+            Multiplier in (0, 1]. 1.0 = no modification, <1.0 = reduce size.
+        """
+        ws_cfg = self.config.risk_limits.win_streak_reduction
+        if not ws_cfg.enabled:
+            return 1.0
+
+        if self._consecutive_wins >= ws_cfg.after_wins:
+            logger.info(
+                "Win streak reduction: %d consecutive wins, size × %.2f",
+                self._consecutive_wins, ws_cfg.size_multiplier,
+            )
+            return ws_cfg.size_multiplier
+
+        return 1.0
+
+    def record_trade(self, timestamp: datetime, pnl_pct: float) -> None:
+        """Record a completed trade with percentage PnL.
+
+        Args:
+            timestamp: Trade close time.
+            pnl_pct: Leveraged PnL as percentage of equity.
+        """
         stats = self._get_today(timestamp)
         stats.trades_taken += 1
-        stats.total_pnl += pnl
+        stats.total_pnl += pnl_pct
 
-        if pnl > 0:
+        if pnl_pct > 0:
             stats.wins += 1
-        elif pnl < 0:
+            self._consecutive_wins += 1
+        elif pnl_pct < 0:
             stats.losses += 1
+            self._consecutive_wins = 0  # Reset on loss
 
         stats.peak_pnl = max(stats.peak_pnl, stats.total_pnl)
         drawdown = stats.peak_pnl - stats.total_pnl
         stats.max_drawdown = max(stats.max_drawdown, drawdown)
 
+        # Update cumulative tracking
+        self._cumulative_pnl_pct += pnl_pct
+        self._peak_pnl_pct = max(self._peak_pnl_pct, self._cumulative_pnl_pct)
+
         logger.info(
-            "Trade recorded: PnL=%.4f | Daily: %d trades, total_pnl=%.4f, W/L=%d/%d",
-            pnl,
+            "Trade recorded: PnL=%.2f%% | Daily: %d trades, total=%.2f%%, W/L=%d/%d | "
+            "Cum: %.2f%% (peak: %.2f%%, DD: %.2f%%) | Win streak: %d",
+            pnl_pct,
             stats.trades_taken,
             stats.total_pnl,
             stats.wins,
             stats.losses,
+            self._cumulative_pnl_pct,
+            self._peak_pnl_pct,
+            self._peak_pnl_pct - self._cumulative_pnl_pct,
+            self._consecutive_wins,
         )
+
+    def _get_weekly_pnl(self, timestamp: datetime) -> float:
+        """Sum PnL for the current ISO week."""
+        today = timestamp.date()
+        week_start = today - timedelta(days=today.weekday())
+        total = 0.0
+        for d, stats in self.daily_stats.items():
+            if d >= week_start:
+                total += stats.total_pnl
+        return total
+
+    def reset_halt(self) -> None:
+        """Manually reset a drawdown halt (requires human intervention)."""
+        if self._halted:
+            logger.warning("Risk halt MANUALLY reset by operator")
+            self._halted = False
+            self._halt_reason = ""
 
     def get_daily_summary(self, timestamp: datetime) -> dict:
         """Get summary of today's trading activity."""
@@ -110,4 +207,27 @@ class RiskManager:
             "losses": stats.losses,
             "win_rate": stats.wins / max(stats.trades_taken, 1),
             "max_drawdown": stats.max_drawdown,
+            "cumulative_pnl": self._cumulative_pnl_pct,
+            "peak_pnl": self._peak_pnl_pct,
+            "current_dd": self._peak_pnl_pct - self._cumulative_pnl_pct,
+            "consecutive_wins": self._consecutive_wins,
+            "halted": self._halted,
         }
+
+    def get_state_dict(self) -> dict:
+        """Export state for persistence."""
+        return {
+            "cumulative_pnl_pct": self._cumulative_pnl_pct,
+            "peak_pnl_pct": self._peak_pnl_pct,
+            "consecutive_wins": self._consecutive_wins,
+            "halted": self._halted,
+            "halt_reason": self._halt_reason,
+        }
+
+    def set_state_dict(self, data: dict) -> None:
+        """Restore state from persistence."""
+        self._cumulative_pnl_pct = data.get("cumulative_pnl_pct", 0.0)
+        self._peak_pnl_pct = data.get("peak_pnl_pct", 0.0)
+        self._consecutive_wins = data.get("consecutive_wins", 0)
+        self._halted = data.get("halted", False)
+        self._halt_reason = data.get("halt_reason", "")

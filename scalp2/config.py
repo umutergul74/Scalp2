@@ -261,6 +261,26 @@ class AdaptiveTPSLConfig:
 
 
 @dataclass
+class CooldownConfig:
+    enabled: bool = True
+    bars_after_sl: int = 4
+    bars_after_regime_close: int = 2
+
+
+@dataclass
+class PriceDistanceBlockConfig:
+    enabled: bool = True
+    min_atr_distance: float = 0.5
+
+
+@dataclass
+class ConsecutiveSLCapConfig:
+    enabled: bool = True
+    max_consecutive: int = 3
+    reset_after_win: bool = True
+
+
+@dataclass
 class TradeManagementConfig:
     partial_tp_1_atr: float = 0.6
     partial_tp_1_pct: float = 0.5
@@ -270,6 +290,13 @@ class TradeManagementConfig:
     trailing_distance_atr: float = 0.5
     adaptive_tp_sl: AdaptiveTPSLConfig = field(
         default_factory=AdaptiveTPSLConfig
+    )
+    cooldown: CooldownConfig = field(default_factory=CooldownConfig)
+    price_distance_block: PriceDistanceBlockConfig = field(
+        default_factory=PriceDistanceBlockConfig
+    )
+    consecutive_sl_cap: ConsecutiveSLCapConfig = field(
+        default_factory=ConsecutiveSLCapConfig
     )
 
 
@@ -316,6 +343,23 @@ class TimeOfDayFilterConfig:
 
 
 @dataclass
+class WinStreakSizeConfig:
+    enabled: bool = True
+    after_wins: int = 5
+    size_multiplier: float = 0.7
+
+
+@dataclass
+class RiskLimitsConfig:
+    daily_loss_limit_pct: float = 3.0
+    weekly_loss_limit_pct: float = 5.0
+    drawdown_halt_pct: float = 8.0
+    win_streak_reduction: WinStreakSizeConfig = field(
+        default_factory=WinStreakSizeConfig
+    )
+
+
+@dataclass
 class ExecutionConfig:
     confidence_threshold: float = 0.70
     max_trades_per_day: int = 2
@@ -335,6 +379,7 @@ class ExecutionConfig:
     trade_management: TradeManagementConfig = field(
         default_factory=TradeManagementConfig
     )
+    risk_limits: RiskLimitsConfig = field(default_factory=RiskLimitsConfig)
     model_refresh: ModelRefreshConfig = field(default_factory=ModelRefreshConfig)
     slippage_model: SlippageModelConfig = field(
         default_factory=SlippageModelConfig

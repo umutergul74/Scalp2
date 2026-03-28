@@ -14,6 +14,8 @@ from scalp2.config import Config
 from scalp2.models.hybrid import HybridEncoder
 from scalp2.models.meta_learner import XGBoostMetaLearner
 from scalp2.regime.hmm import RegimeDetector
+from scalp2.execution.trade_manager import TradeManager
+from scalp2.execution.risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,8 @@ class SignalGenerator:
         scaler,
         top_feature_indices: np.ndarray,
         device: torch.device | None = None,
+        trade_manager: TradeManager | None = None,
+        risk_manager: RiskManager | None = None,
     ):
         self.config = config
         self.model = model
@@ -79,6 +83,8 @@ class SignalGenerator:
         self.model.eval()
         self.daily_trade_count = 0
         self.last_trade_date = None
+        self.trade_manager = trade_manager
+        self.risk_manager = risk_manager
 
     def _reset_daily_counter(self, current_time: datetime) -> None:
         """Reset daily trade counter at midnight UTC."""
@@ -203,8 +209,40 @@ class SignalGenerator:
             tp = current_price - full_tp_atr * current_atr
             sl = current_price + self.config.labeling.sl_multiplier * current_atr
 
-        # 12. Position sizing (fractional Kelly)
+        # 12. Consecutive SL protection check (Enhancement 1)
+        if self.trade_manager is not None:
+            can_enter, skip_reason = self.trade_manager.can_enter_trade(
+                direction=direction.value,
+                entry_price=current_price,
+                current_atr=current_atr,
+            )
+            if not can_enter:
+                logger.info("Trade blocked by SL protection: %s", skip_reason)
+                return self._no_trade(
+                    current_price, current_time, skip_reason,
+                    market_regime=current_regime, probs=prob_dict,
+                )
+
+        # 13. Portfolio risk check (Enhancement 5)
+        if self.risk_manager is not None:
+            can_trade, risk_reason = self.risk_manager.can_trade(
+                timestamp=current_time,
+            )
+            if not can_trade:
+                logger.info("Trade blocked by risk manager: %s", risk_reason)
+                return self._no_trade(
+                    current_price, current_time, risk_reason,
+                    market_regime=current_regime, probs=prob_dict,
+                )
+
+        # 14. Position sizing (fractional Kelly) with risk modifier
         position_size = self._kelly_size(confidence, exec_cfg, adaptive)
+        if self.risk_manager is not None:
+            size_modifier = self.risk_manager.get_position_size_modifier()
+            if size_modifier < 1.0:
+                position_size *= size_modifier
+                logger.info("Position size reduced by risk: %.2f × %.3f = %.3f",
+                            size_modifier, position_size / size_modifier, position_size)
 
         self.daily_trade_count += 1
 

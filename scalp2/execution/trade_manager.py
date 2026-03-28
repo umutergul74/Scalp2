@@ -1,4 +1,4 @@
-"""Dynamic trade management — partial TPs, breakeven, trailing stops."""
+"""Dynamic trade management — partial TPs, breakeven, trailing stops, SL protection."""
 
 from __future__ import annotations
 
@@ -52,11 +52,145 @@ class TradeManager:
         - Trailing: After 0.8 ATR profit, trail 0.5 ATR behind price
         - Time stop: Close at max_holding bars
         - Regime stop: Close if regime flips to choppy
+        - Cooldown: Pause N bars after SL
+        - Price distance: Block re-entry near SL price
+        - Consecutive SL cap: Halt after N consecutive SLs
     """
 
     def __init__(self, config: TradeManagementConfig, max_holding_bars: int = 10):
         self.config = config
         self.max_holding_bars = max_holding_bars
+
+        # ── Enhancement 1: Consecutive SL Protection State ──
+        self._cooldown_until_bar: int = -1  # Global bar index until which entry blocked
+        self._last_sl_price: float = 0.0
+        self._last_sl_direction: str = ""
+        self._consecutive_sl_count: int = 0
+        self._current_bar: int = 0  # Monotonically increasing bar counter
+
+    # ── Entry Gate ────────────────────────────────────────────────────────
+
+    def can_enter_trade(
+        self,
+        direction: str,
+        entry_price: float,
+        current_atr: float,
+    ) -> tuple[bool, str]:
+        """Check if a new trade is permitted by SL protection rules.
+
+        Args:
+            direction: "LONG" or "SHORT".
+            entry_price: Proposed entry price.
+            current_atr: Current ATR value.
+
+        Returns:
+            (allowed, skip_reason) tuple.
+        """
+        cfg = self.config
+
+        # 1. Cooldown after SL
+        if cfg.cooldown.enabled and self._current_bar < self._cooldown_until_bar:
+            remaining = self._cooldown_until_bar - self._current_bar
+            logger.info("Cooldown active: %d bars remaining", remaining)
+            return False, "cooldown"
+
+        # 2. Price distance block (same direction only)
+        if (
+            cfg.price_distance_block.enabled
+            and self._last_sl_price > 0
+            and direction == self._last_sl_direction
+            and current_atr > 0
+        ):
+            distance_atr = abs(entry_price - self._last_sl_price) / current_atr
+            if distance_atr < cfg.price_distance_block.min_atr_distance:
+                logger.info(
+                    "Price too close to last SL: %.2f ATR (min: %.2f)",
+                    distance_atr,
+                    cfg.price_distance_block.min_atr_distance,
+                )
+                return False, "price_too_close"
+
+        # 3. Consecutive SL cap
+        if (
+            cfg.consecutive_sl_cap.enabled
+            and self._consecutive_sl_count >= cfg.consecutive_sl_cap.max_consecutive
+        ):
+            logger.info(
+                "Consecutive SL cap reached: %d/%d",
+                self._consecutive_sl_count,
+                cfg.consecutive_sl_cap.max_consecutive,
+            )
+            return False, "consecutive_sl_cap"
+
+        return True, "approved"
+
+    def record_trade_result(self, status: TradeStatus, exit_price: float, direction: str, atr: float) -> None:
+        """Record the result of a closed trade for protection state tracking.
+
+        Args:
+            status: How the trade was closed.
+            exit_price: Price at which the trade was closed.
+            direction: Trade direction ("LONG" or "SHORT").
+            atr: ATR at entry for distance calculations.
+        """
+        cfg = self.config
+
+        if status == TradeStatus.CLOSED_SL:
+            self._consecutive_sl_count += 1
+            self._last_sl_price = exit_price
+            self._last_sl_direction = direction
+
+            # Activate cooldown
+            if cfg.cooldown.enabled:
+                self._cooldown_until_bar = self._current_bar + cfg.cooldown.bars_after_sl
+                logger.info(
+                    "SL #%d — cooldown activated for %d bars (until bar %d)",
+                    self._consecutive_sl_count,
+                    cfg.cooldown.bars_after_sl,
+                    self._cooldown_until_bar,
+                )
+
+        elif status == TradeStatus.CLOSED_REGIME:
+            # Shorter cooldown for regime closes
+            if cfg.cooldown.enabled:
+                self._cooldown_until_bar = self._current_bar + cfg.cooldown.bars_after_regime_close
+
+        elif status in (TradeStatus.CLOSED_TP, TradeStatus.PARTIAL_TP):
+            # Win resets consecutive SL counter
+            if cfg.consecutive_sl_cap.enabled and cfg.consecutive_sl_cap.reset_after_win:
+                if self._consecutive_sl_count > 0:
+                    logger.info(
+                        "Win resets consecutive SL counter (%d → 0)",
+                        self._consecutive_sl_count,
+                    )
+                self._consecutive_sl_count = 0
+            # Clear SL price tracking on win
+            self._last_sl_price = 0.0
+            self._last_sl_direction = ""
+
+    def advance_bar(self) -> None:
+        """Advance the internal bar counter. Call once per 15m cycle."""
+        self._current_bar += 1
+
+    def get_protection_state(self) -> dict:
+        """Export protection state for persistence / logging."""
+        return {
+            "cooldown_until_bar": self._cooldown_until_bar,
+            "last_sl_price": self._last_sl_price,
+            "last_sl_direction": self._last_sl_direction,
+            "consecutive_sl_count": self._consecutive_sl_count,
+            "current_bar": self._current_bar,
+        }
+
+    def set_protection_state(self, state: dict) -> None:
+        """Restore protection state from persistence."""
+        self._cooldown_until_bar = state.get("cooldown_until_bar", -1)
+        self._last_sl_price = state.get("last_sl_price", 0.0)
+        self._last_sl_direction = state.get("last_sl_direction", "")
+        self._consecutive_sl_count = state.get("consecutive_sl_count", 0)
+        self._current_bar = state.get("current_bar", 0)
+
+    # ── Trade Update (existing logic) ────────────────────────────────────
 
     def update(
         self,
