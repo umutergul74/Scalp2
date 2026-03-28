@@ -57,15 +57,19 @@ class BinanceExecutor:
                 "BINANCE_API_KEY and BINANCE_API_SECRET must be set for live trading"
             )
 
-        self.exchange = ccxt.binanceusdm({
-            "apiKey": api_key,
-            "secret": api_secret,
+        # Paper mode: don't pass API keys (public endpoints only, avoids auth errors)
+        exchange_config = {
             "enableRateLimit": True,
             "options": {
                 "defaultType": "future",
                 "adjustForTimeDifference": True,
             },
-        })
+        }
+        if not paper_mode:
+            exchange_config["apiKey"] = api_key
+            exchange_config["secret"] = api_secret
+
+        self.exchange = ccxt.binanceusdm(exchange_config)
 
         # Enable Binance Testnet (demo.binance.com) if specified
         is_testnet = os.environ.get("BINANCE_TESTNET", "false").lower() in ("true", "1", "yes")
