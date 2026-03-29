@@ -170,7 +170,7 @@ execution:
     method: "fractional_kelly"
     max_fraction: 0.20
     kelly_fraction: 0.60
-    leverage: 10
+    leverage: 20
     maintenance_margin: 0.005
 
   trade_management:
