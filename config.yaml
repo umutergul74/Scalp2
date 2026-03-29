@@ -176,7 +176,7 @@ execution:
   trade_management:
     partial_tp_1_atr: 0.5
     partial_tp_1_pct: 0.5
-    full_tp_atr: 1.2
+    full_tp_atr: 2.0
     breakeven_trigger_atr: 0.5
     trailing_activation_atr: 0.8
     trailing_distance_atr: 0.4

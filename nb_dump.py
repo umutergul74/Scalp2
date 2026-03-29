@@ -311,18 +311,36 @@ for fold_data in tqdm(wf_predictions, desc='Backtesting folds'):
             # Recompute SL from actual entry price
             if direction == "LONG":
                 sl = entry_price - label_cfg.sl_multiplier * atr
+                tp = entry_price + trade_mgmt_cfg.full_tp_atr * atr
             else:
                 sl = entry_price + label_cfg.sl_multiplier * atr
+                tp = entry_price - trade_mgmt_cfg.full_tp_atr * atr
 
-            # Smart Exit Engine: structural SL adjustment at entry
+            # Smart Exit Engine: structural adjustments at entry
             original_sl = sl
+            adaptive_full_tp_atr = None
             struct_cfg = trade_mgmt_cfg.structural_exit
             if struct_cfg.enabled:
                 entry_struct = {
                     'swing_high': float(row.get('swing_high_price', float('nan'))) if 'swing_high_price' in df.columns else float('nan'),
                     'swing_low': float(row.get('swing_low_price', float('nan'))) if 'swing_low_price' in df.columns else float('nan'),
+                    'fvg_bull': float(row.get('fvg_bull_price', float('nan'))) if 'fvg_bull_price' in df.columns else float('nan'),
+                    'fvg_bear': float(row.get('fvg_bear_price', float('nan'))) if 'fvg_bear_price' in df.columns else float('nan'),
+                    'vwap': float(row.get('vwap', float('nan'))) if 'vwap' in df.columns else float('nan'),
                 }
                 import math
+                
+                # --- A. FVG TP Stretch ---
+                fvg = entry_struct.get('fvg_bear' if direction == 'LONG' else 'fvg_bull')
+                if fvg is not None and not math.isnan(fvg):
+                    if direction == 'LONG' and fvg > entry_price:
+                        if abs(tp - fvg) < struct_cfg.fvg_proximity_atr * atr:
+                            tp = fvg
+                    elif direction == 'SHORT' and fvg < entry_price:
+                        if abs(tp - fvg) < struct_cfg.fvg_proximity_atr * atr:
+                            tp = fvg
+
+                # --- B. Sweep-Resistant SL ---
                 swing = entry_struct.get('swing_low' if direction == 'LONG' else 'swing_high')
                 if swing is not None and not math.isnan(swing):
                     buffer = struct_cfg.sweep_buffer_atr * atr
@@ -337,6 +355,24 @@ for fold_data in tqdm(wf_predictions, desc='Backtesting folds'):
                             new_sl = swing + buffer
                             if abs(new_sl - entry_price) - abs(sl - entry_price) <= max_stretch:
                                 sl = new_sl
+
+                # --- C. VWAP TP Stretch ---
+                vwap = entry_struct.get('vwap')
+                if vwap is not None and not math.isnan(vwap):
+                    if direction == 'LONG' and vwap > entry_price:
+                        if abs(tp - vwap) < struct_cfg.vwap_margin_atr * atr and vwap > tp:
+                            tp = vwap
+                    elif direction == 'SHORT' and vwap < entry_price:
+                        if abs(tp - vwap) < struct_cfg.vwap_margin_atr * atr and vwap < tp:
+                            tp = vwap
+
+                # Convert adapted absolute TP back to ATR distance for TradeManager compatibility
+                if direction == 'LONG':
+                    if abs(tp - (entry_price + trade_mgmt_cfg.full_tp_atr * atr)) > 1e-6:
+                        adaptive_full_tp_atr = abs(tp - entry_price) / atr
+                else:
+                    if abs(tp - (entry_price - trade_mgmt_cfg.full_tp_atr * atr)) > 1e-6:
+                        adaptive_full_tp_atr = abs(tp - entry_price) / atr
 
             # Kelly position sizing
             p = confidence
@@ -360,6 +396,7 @@ for fold_data in tqdm(wf_predictions, desc='Backtesting folds'):
                 current_stop_loss=sl,
                 take_profit=0.0,
                 atr_at_entry=atr,
+                adaptive_full_tp_atr=adaptive_full_tp_atr,
             )
             entry_bar = bar
             daily_count += 1
