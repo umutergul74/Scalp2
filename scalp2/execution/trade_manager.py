@@ -234,10 +234,32 @@ class TradeManager:
 
         # Check regime change
         if is_choppy:
-            trade.status = TradeStatus.CLOSED_REGIME
-            trade.pnl = unrealized * trade.remaining_size
-            logger.info("Trade closed: regime change to choppy (PnL=%.4f)", trade.pnl)
-            return trade
+            # Protect profitable positions with partial TP already taken —
+            # let trailing stop manage the exit instead of force-closing
+            if trade.status == TradeStatus.PARTIAL_TP and unrealized > 0:
+                logger.info(
+                    "Choppy regime but partial TP already taken and in profit "
+                    "(unrealized=%.4f) — trailing stop protects",
+                    unrealized,
+                )
+                # Tighten trailing stop to lock in more profit during choppy
+                trail_dist = (
+                    trade.adaptive_trailing_dist_atr
+                    or self.config.trailing_distance_atr
+                ) * trade.atr_at_entry * 0.5  # 50% tighter in choppy
+                if is_long:
+                    tight_sl = current_close - trail_dist
+                    if tight_sl > trade.current_stop_loss:
+                        trade.current_stop_loss = tight_sl
+                else:
+                    tight_sl = current_close + trail_dist
+                    if tight_sl < trade.current_stop_loss:
+                        trade.current_stop_loss = tight_sl
+            else:
+                trade.status = TradeStatus.CLOSED_REGIME
+                trade.pnl = unrealized * trade.remaining_size
+                logger.info("Trade closed: regime change to choppy (PnL=%.4f)", trade.pnl)
+                return trade
 
         # Check time barrier
         if trade.bars_held >= self.max_holding_bars:
