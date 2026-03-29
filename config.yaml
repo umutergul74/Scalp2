@@ -180,6 +180,13 @@ execution:
     breakeven_trigger_atr: 0.5
     trailing_activation_atr: 0.8
     trailing_distance_atr: 0.4
+    structural_exit:
+      enabled: true
+      fvg_proximity_atr: 0.3
+      sweep_buffer_atr: 0.15
+      vwap_margin_atr: 0.5
+      max_sl_stretch_atr: 0.4
+      normalize_risk: true       # Option A: shrink position when SL widens
     adaptive_tp_sl:
       enabled: true
       high_vol_pctile: 0.80

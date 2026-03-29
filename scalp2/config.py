@@ -281,6 +281,27 @@ class ConsecutiveSLCapConfig:
 
 
 @dataclass
+class StructuralExitConfig:
+    """Smart Exit Engine — structure-aware TP/SL adjustments.
+
+    FVG proximity: if TP lands within `fvg_proximity_atr` ATRs of an unfilled
+        FVG, extend TP into the gap to capture its magnetic pull.
+    Sweep buffer: if SL lands within `sweep_buffer_atr` ATRs of a swing
+        high/low, nudge SL behind the structural level.
+    VWAP margin: if partial TP is within `vwap_margin_atr` ATRs of VWAP,
+        extend partial TP to VWAP.
+    Risk normalization (Option A): when SL is widened, reduce position size
+        proportionally so absolute $ risk stays constant.
+    """
+    enabled: bool = True
+    fvg_proximity_atr: float = 0.3   # TP stretch radius around FVG
+    sweep_buffer_atr: float = 0.15   # SL nudge distance behind swing level
+    vwap_margin_atr: float = 0.5     # partial TP stretch radius to VWAP
+    max_sl_stretch_atr: float = 0.4  # cap on how far SL can be widened
+    normalize_risk: bool = True      # Option A: shrink size to keep $ risk constant
+
+
+@dataclass
 class TradeManagementConfig:
     partial_tp_1_atr: float = 0.6
     partial_tp_1_pct: float = 0.5
@@ -288,6 +309,9 @@ class TradeManagementConfig:
     breakeven_trigger_atr: float = 0.6
     trailing_activation_atr: float = 0.8
     trailing_distance_atr: float = 0.5
+    structural_exit: StructuralExitConfig = field(
+        default_factory=StructuralExitConfig
+    )
     adaptive_tp_sl: AdaptiveTPSLConfig = field(
         default_factory=AdaptiveTPSLConfig
     )

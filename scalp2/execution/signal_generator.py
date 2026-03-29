@@ -102,6 +102,7 @@ class SignalGenerator:
         current_time: datetime,
         current_adx: float = 999.0,
         atr_percentile: float = 1.0,
+        structural_levels: dict | None = None,
     ) -> TradeSignal:
         """Generate a trade signal from prepared features.
 
@@ -209,6 +210,13 @@ class SignalGenerator:
             tp = current_price - full_tp_atr * current_atr
             sl = current_price + self.config.labeling.sl_multiplier * current_atr
 
+        # 11b. Smart Exit Engine — structural TP/SL adjustments
+        original_sl = sl
+        tp, sl = self._apply_structural_adjustments(
+            direction, current_price, tp, sl, current_atr,
+            structural_levels or {},
+        )
+
         # 12. Consecutive SL protection check (Enhancement 1)
         if self.trade_manager is not None:
             can_enter, skip_reason = self.trade_manager.can_enter_trade(
@@ -243,6 +251,22 @@ class SignalGenerator:
                 position_size *= size_modifier
                 logger.info("Position size reduced by risk: %.2f × %.3f = %.3f",
                             size_modifier, position_size / size_modifier, position_size)
+
+        # 14b. Option A — Risk Normalization: if SL was widened by structural
+        #      adjustment, shrink position proportionally to keep $ risk constant.
+        struct_cfg = exec_cfg.trade_management.structural_exit
+        if struct_cfg.enabled and struct_cfg.normalize_risk and sl != original_sl:
+            original_risk = abs(current_price - original_sl)
+            new_risk = abs(current_price - sl)
+            if new_risk > original_risk and original_risk > 0:
+                risk_ratio = original_risk / new_risk
+                logger.info(
+                    "Risk normalization (Option A): SL widened %.1f → %.1f, "
+                    "size %.4f × %.3f = %.4f",
+                    original_sl, sl, position_size, risk_ratio,
+                    position_size * risk_ratio,
+                )
+                position_size *= risk_ratio
 
         self.daily_trade_count += 1
 
@@ -313,6 +337,109 @@ class SignalGenerator:
         # Apply fractional Kelly and cap
         size = kelly * exec_cfg.position_sizing.kelly_fraction
         return min(size, exec_cfg.position_sizing.max_fraction)
+
+    def _apply_structural_adjustments(
+        self,
+        direction: Direction,
+        entry: float,
+        tp: float,
+        sl: float,
+        atr: float,
+        levels: dict,
+    ) -> tuple[float, float]:
+        """Adjust TP/SL based on structural market levels.
+
+        A. FVG-Aware TP: if TP is within `fvg_proximity_atr` of an unfilled
+           FVG, extend TP into/beyond the gap.
+        B. Sweep-Resistant SL: if SL coincides with a swing high/low,
+           nudge SL behind the structural level.
+        C. VWAP-Anchored TP: if TP is heading towards VWAP and within
+           margin, extend TP to VWAP.
+
+        Returns:
+            (adjusted_tp, adjusted_sl)
+        """
+        cfg = self.config.execution.trade_management.structural_exit
+        if not cfg.enabled or atr <= 0:
+            return tp, sl
+
+        is_long = direction == Direction.LONG
+        adjusted_tp = tp
+        adjusted_sl = sl
+
+        # ── A. FVG-Aware TP ───────────────────────────────────────────────
+        fvg_target = levels.get("fvg_bear" if is_long else "fvg_bull")
+        if fvg_target is not None and not np.isnan(fvg_target):
+            # For LONG: bearish FVG above is a magnet (price gets pulled up)
+            # For SHORT: bullish FVG below is a magnet (price gets pulled down)
+            if is_long and fvg_target > entry:
+                dist_to_fvg = abs(tp - fvg_target)
+                if dist_to_fvg < cfg.fvg_proximity_atr * atr:
+                    # TP is close to FVG — extend into the gap
+                    adjusted_tp = fvg_target
+                    logger.info(
+                        "FVG stretch (LONG): TP %.1f → %.1f (FVG magnetic pull)",
+                        tp, adjusted_tp,
+                    )
+            elif not is_long and fvg_target < entry:
+                dist_to_fvg = abs(tp - fvg_target)
+                if dist_to_fvg < cfg.fvg_proximity_atr * atr:
+                    adjusted_tp = fvg_target
+                    logger.info(
+                        "FVG stretch (SHORT): TP %.1f → %.1f (FVG magnetic pull)",
+                        tp, adjusted_tp,
+                    )
+
+        # ── B. Sweep-Resistant SL ─────────────────────────────────────────
+        swing_level = levels.get("swing_low" if is_long else "swing_high")
+        if swing_level is not None and not np.isnan(swing_level):
+            buffer = cfg.sweep_buffer_atr * atr
+            max_stretch = cfg.max_sl_stretch_atr * atr
+
+            if is_long:
+                # LONG SL is below entry. Danger: SL sits right on swing low pool.
+                if abs(adjusted_sl - swing_level) < buffer:
+                    # Nudge SL below the swing low + buffer
+                    new_sl = swing_level - buffer
+                    # Cap the stretch so we don't balloon risk infinitely
+                    if abs(entry - new_sl) - abs(entry - sl) <= max_stretch:
+                        logger.info(
+                            "Sweep shield (LONG): SL %.1f → %.1f (behind swing low %.1f)",
+                            adjusted_sl, new_sl, swing_level,
+                        )
+                        adjusted_sl = new_sl
+            else:
+                # SHORT SL is above entry. Danger: SL sits on swing high pool.
+                if abs(adjusted_sl - swing_level) < buffer:
+                    new_sl = swing_level + buffer
+                    if abs(new_sl - entry) - abs(sl - entry) <= max_stretch:
+                        logger.info(
+                            "Sweep shield (SHORT): SL %.1f → %.1f (behind swing high %.1f)",
+                            adjusted_sl, new_sl, swing_level,
+                        )
+                        adjusted_sl = new_sl
+
+        # ── C. VWAP-Anchored TP ───────────────────────────────────────────
+        vwap = levels.get("vwap")
+        if vwap is not None and not np.isnan(vwap):
+            if is_long and vwap > entry:
+                dist_to_vwap = abs(adjusted_tp - vwap)
+                if dist_to_vwap < cfg.vwap_margin_atr * atr and vwap > adjusted_tp:
+                    logger.info(
+                        "VWAP stretch (LONG): TP %.1f → %.1f (VWAP anchor)",
+                        adjusted_tp, vwap,
+                    )
+                    adjusted_tp = vwap
+            elif not is_long and vwap < entry:
+                dist_to_vwap = abs(adjusted_tp - vwap)
+                if dist_to_vwap < cfg.vwap_margin_atr * atr and vwap < adjusted_tp:
+                    logger.info(
+                        "VWAP stretch (SHORT): TP %.1f → %.1f (VWAP anchor)",
+                        adjusted_tp, vwap,
+                    )
+                    adjusted_tp = vwap
+
+        return adjusted_tp, adjusted_sl
 
     def _no_trade(
         self, price: float, time: datetime, reason: str,

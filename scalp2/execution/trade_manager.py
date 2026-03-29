@@ -199,6 +199,7 @@ class TradeManager:
         current_low: float,
         current_close: float,
         is_choppy: bool = False,
+        structural_levels: dict | None = None,
     ) -> TradeState:
         """Update trade state based on latest bar.
 
@@ -208,6 +209,8 @@ class TradeManager:
             current_low: Current bar low.
             current_close: Current bar close.
             is_choppy: Whether current regime is choppy.
+            structural_levels: Dict with vwap, fvg_bull, fvg_bear,
+                swing_high, swing_low absolute prices.
 
         Returns:
             Updated trade state.
@@ -293,7 +296,58 @@ class TradeManager:
         if atr_move >= trailing_act:
             self._update_trailing_stop(trade, current_close, is_long)
 
+        # ── Smart Exit Engine: protect trailing SL from sweep zones ──
+        if structural_levels:
+            self._adjust_sl_to_structure(trade, is_long, structural_levels)
+
         return trade
+
+    def _adjust_sl_to_structure(
+        self,
+        trade: TradeState,
+        is_long: bool,
+        levels: dict,
+    ) -> None:
+        """Dynamically nudge trailing SL away from sweep zones.
+
+        If the current trailing SL sits inside a swing high/low liquidity
+        pool, move it behind the structural level so market-maker sweeps
+        don't prematurely stop us out.
+        """
+        struct_cfg = self.config.structural_exit
+        if not struct_cfg.enabled or trade.atr_at_entry <= 0:
+            return
+
+        buffer = struct_cfg.sweep_buffer_atr * trade.atr_at_entry
+
+        if is_long:
+            swing_low = levels.get("swing_low")
+            if swing_low is not None and not _isnan(swing_low):
+                # SL is dangerously close to the swing low
+                if abs(trade.current_stop_loss - swing_low) < buffer:
+                    safe_sl = swing_low - buffer
+                    # Only move SL further away, never closer
+                    if safe_sl < trade.current_stop_loss:
+                        max_stretch = struct_cfg.max_sl_stretch_atr * trade.atr_at_entry
+                        if trade.current_stop_loss - safe_sl <= max_stretch:
+                            logger.debug(
+                                "Trailing sweep shield: SL %.1f → %.1f (swing_low=%.1f)",
+                                trade.current_stop_loss, safe_sl, swing_low,
+                            )
+                            trade.current_stop_loss = safe_sl
+        else:
+            swing_high = levels.get("swing_high")
+            if swing_high is not None and not _isnan(swing_high):
+                if abs(trade.current_stop_loss - swing_high) < buffer:
+                    safe_sl = swing_high + buffer
+                    if safe_sl > trade.current_stop_loss:
+                        max_stretch = struct_cfg.max_sl_stretch_atr * trade.atr_at_entry
+                        if safe_sl - trade.current_stop_loss <= max_stretch:
+                            logger.debug(
+                                "Trailing sweep shield: SL %.1f → %.1f (swing_high=%.1f)",
+                                trade.current_stop_loss, safe_sl, swing_high,
+                            )
+                            trade.current_stop_loss = safe_sl
 
     def _check_stop_loss(
         self, trade: TradeState, high: float, low: float, is_long: bool
@@ -361,3 +415,12 @@ class TradeManager:
             new_sl = price + trail_dist
             if new_sl < trade.current_stop_loss:
                 trade.current_stop_loss = new_sl
+
+
+def _isnan(value) -> bool:
+    """Safe NaN check for float values."""
+    try:
+        import math
+        return math.isnan(value)
+    except (TypeError, ValueError):
+        return True

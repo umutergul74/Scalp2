@@ -30,6 +30,8 @@ def fair_value_gaps(df: pd.DataFrame, min_gap_pct: float = 0.001) -> pd.DataFram
     fvg_bearish = np.zeros(n, dtype=np.float32)
     fvg_bull_dist = np.full(n, np.nan, dtype=np.float32)
     fvg_bear_dist = np.full(n, np.nan, dtype=np.float32)
+    fvg_bull_price = np.full(n, np.nan, dtype=np.float32)
+    fvg_bear_price = np.full(n, np.nan, dtype=np.float32)
 
     # Track active (unfilled) FVGs
     active_bull_fvgs: list[tuple[float, float]] = []  # (gap_low, gap_high)
@@ -60,9 +62,11 @@ def fair_value_gaps(df: pd.DataFrame, min_gap_pct: float = 0.001) -> pd.DataFram
         if active_bull_fvgs:
             nearest = min(active_bull_fvgs, key=lambda x: abs(close[i] - x[1]))
             fvg_bull_dist[i] = (close[i] - nearest[1]) / (close[i] + 1e-10)
+            fvg_bull_price[i] = nearest[1]  # absolute price of nearest bullish FVG edge
         if active_bear_fvgs:
             nearest = min(active_bear_fvgs, key=lambda x: abs(close[i] - x[0]))
             fvg_bear_dist[i] = (nearest[0] - close[i]) / (close[i] + 1e-10)
+            fvg_bear_price[i] = nearest[0]  # absolute price of nearest bearish FVG edge
 
     return pd.DataFrame(
         {
@@ -70,6 +74,8 @@ def fair_value_gaps(df: pd.DataFrame, min_gap_pct: float = 0.001) -> pd.DataFram
             "fvg_bearish": fvg_bearish,
             "fvg_bull_dist": fvg_bull_dist,
             "fvg_bear_dist": fvg_bear_dist,
+            "fvg_bull_price": fvg_bull_price,
+            "fvg_bear_price": fvg_bear_price,
         },
         index=df.index,
     )
@@ -96,12 +102,16 @@ def liquidity_sweeps(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
     sweep_high = np.zeros(n, dtype=np.float32)
     sweep_low = np.zeros(n, dtype=np.float32)
     bars_since_sweep = np.full(n, np.nan, dtype=np.float32)
+    swing_high_price = np.full(n, np.nan, dtype=np.float32)
+    swing_low_price = np.full(n, np.nan, dtype=np.float32)
 
     last_sweep_bar = -999
 
     for i in range(lookback, n):
         window_high = np.max(high[i - lookback : i])
         window_low = np.min(low[i - lookback : i])
+        swing_high_price[i] = window_high
+        swing_low_price[i] = window_low
 
         # Sweep high: wick above prior high but close below
         if high[i] > window_high and close[i] < window_high:
@@ -121,6 +131,8 @@ def liquidity_sweeps(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
             "sweep_high": sweep_high,
             "sweep_low": sweep_low,
             "bars_since_sweep": bars_since_sweep,
+            "swing_high_price": swing_high_price,
+            "swing_low_price": swing_low_price,
         },
         index=df.index,
     )

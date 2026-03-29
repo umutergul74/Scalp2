@@ -135,6 +135,15 @@ class DataPipeline:
             minus_di = float(last_row.get("minus_di", 0.0)) if "minus_di" in df_full.columns else 0.0
             macd_hist = float(last_row.get("macd_hist", 0.0)) if "macd_hist" in df_full.columns else 0.0
 
+            # ── Structural Levels (Smart Exit Engine) ──
+            structural_levels = {
+                "vwap": float(last_row.get("vwap", np.nan)),
+                "fvg_bull": float(last_row.get("fvg_bull_price", np.nan)),
+                "fvg_bear": float(last_row.get("fvg_bear_price", np.nan)),
+                "swing_high": float(last_row.get("swing_high_price", np.nan)),
+                "swing_low": float(last_row.get("swing_low_price", np.nan)),
+            }
+
             return {
                 "features_scaled": window,
                 "regime_df": regime_df,
@@ -154,6 +163,7 @@ class DataPipeline:
                     "minus_di": minus_di,
                     "macd_hist": macd_hist,
                 },
+                "structural_levels": structural_levels,
             }
 
         except Exception as e:

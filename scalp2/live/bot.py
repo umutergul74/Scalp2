@@ -287,6 +287,7 @@ class LiveBot:
             current_time=now,
             current_adx=data["current_adx"],
             atr_percentile=data["atr_percentile"],
+            structural_levels=data.get("structural_levels"),
         )
 
         self.state.last_signal_time = now_key
