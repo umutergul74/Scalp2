@@ -438,23 +438,24 @@ for fold_data in tqdm(wf_predictions, desc='Backtesting folds'):
             continue
 
         # ADX filter
-        adx_val = row.get('adx_14', 999.0) if hasattr(row, 'get') else (
-            row['adx_14'] if 'adx_14' in df.columns else 999.0)
-        if adx_val < MIN_ADX:
+        adx_val = row.get('adx', 999.0) if hasattr(row, 'get') else (
+            row['adx'] if 'adx' in df.columns else 999.0)
+        if adx_val < getattr(exec_cfg, 'min_adx', MIN_ADX):
             skip_reasons['low_adx'] += 1
             continue
 
         # ATR percentile filter
-        atr_pct = row['atr_pctile'] if 'atr_pctile' in df.columns else 1.0
-        if atr_pct < MIN_ATR_PCTILE:
+        atr_pct_val = row['atr_pct'] if 'atr_pct' in df.columns else 1.0
+        if atr_pct_val < getattr(exec_cfg, 'min_atr_percentile', 0.05):
             skip_reasons['low_volatility'] += 1
             continue
 
         # Choppy regime filter (forward-only probs)
         if has_regime and i < len(regime_probs):
             if regime_probs[i, 2] > CHOPPY_THRESHOLD:
-                skip_reasons['choppy'] += 1
-                continue
+                if adx_val < getattr(exec_cfg, 'choppy_adx_override', 25.0):
+                    skip_reasons['choppy'] += 1
+                    continue
 
         # Check next bar exists for entry
         next_bar = pred_offset + i + 1
