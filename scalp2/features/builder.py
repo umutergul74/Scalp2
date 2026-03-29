@@ -112,6 +112,10 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
         
         # Unbounded counters
         "bars_since_sweep",     # grows without bound (can reach thousands)
+        
+        # Absolute structural price levels (Smart Exit Engine only, NOT for ML)
+        "fvg_bull_price", "fvg_bear_price",
+        "swing_high_price", "swing_low_price",
     }
     
     # Base prefixes to drop (after stripping MTF prefix)
