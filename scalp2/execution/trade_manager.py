@@ -273,12 +273,16 @@ class TradeManager:
 
         partial_tp = trade.adaptive_partial_tp_atr or self.config.partial_tp_1_atr
         if trade.status == TradeStatus.OPEN and atr_move >= partial_tp:
-            self._execute_partial_tp(trade, current_close, is_long)
+            # Use exact limit price instead of bar close
+            tp_dist = partial_tp * trade.atr_at_entry
+            tp_price = trade.entry_price + tp_dist if is_long else trade.entry_price - tp_dist
+            self._execute_partial_tp(trade, tp_price, is_long)
 
         # Check full TP
         full_tp = trade.adaptive_full_tp_atr or self.config.full_tp_atr
         if atr_move >= full_tp:
-            trade.pnl += unrealized * trade.remaining_size
+            tp_pct = (full_tp * trade.atr_at_entry) / trade.entry_price
+            trade.pnl += tp_pct * trade.remaining_size
             trade.remaining_size = 0.0
             trade.status = TradeStatus.CLOSED_TP
             logger.info("Trade closed: full TP (PnL=%.4f)", trade.pnl)
