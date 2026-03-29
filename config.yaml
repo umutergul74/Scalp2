@@ -168,8 +168,8 @@ execution:
 
   position_sizing:
     method: "fractional_kelly"
-    max_fraction: 0.15
-    kelly_fraction: 0.55
+    max_fraction: 0.20
+    kelly_fraction: 0.60
     leverage: 10
     maintenance_margin: 0.005
 
