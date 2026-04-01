@@ -318,7 +318,7 @@ class LiveBot:
                 confidence=signal.confidence, probs=signal.probabilities
             )
             # Online HMM update even when no trade
-            self._try_online_hmm_update(data)
+            await self._try_online_hmm_update(data)
             return
 
         # We have a signal — execute!
@@ -342,9 +342,9 @@ class LiveBot:
         await self._execute_signal(signal, data["current_atr"])
 
         # Online HMM update with latest bar
-        self._try_online_hmm_update(data)
+        await self._try_online_hmm_update(data)
 
-    def _try_online_hmm_update(self, data: dict) -> None:
+    async def _try_online_hmm_update(self, data: dict) -> None:
         """Update HMM parameters with the latest bar if online updates enabled."""
         if (
             self.regime_detector is not None
@@ -358,6 +358,31 @@ class LiveBot:
                 if updated:
                     logger.info("HMM parameters re-estimated from online data")
                     self._save_regime_stats()
+
+                # Health check after every update (not just re-estimation)
+                health = self.regime_detector.health_check()
+                if health['collapsed']:
+                    logger.critical(
+                        "HMM COLLAPSED! Issues: %s. Auto-resetting.",
+                        health['issues'],
+                    )
+                    self.regime_detector.reset_online_stats()
+                    # Delete corrupted stats file
+                    stats_path = self.state_dir / "regime_online_stats.json"
+                    if stats_path.exists():
+                        stats_path.unlink()
+                        logger.info("Deleted corrupted regime_online_stats.json")
+                    # Telegram critical alert
+                    await self.notifier.error(
+                        "HMM REJİM ÇÖKMESI ALGILANDI!\n"
+                        f"Sorunlar: {', '.join(health['issues'])}\n"
+                        "Otomatik olarak eğitilmiş parametrelere sıfırlandı.\n"
+                        "Kontrol et: Eğer tekrar çökerse modeli yeniden eğit."
+                    )
+                elif not health['healthy']:
+                    logger.warning(
+                        "HMM health warning: %s", health['issues']
+                    )
             except Exception as e:
                 logger.warning("HMM online update failed: %s", e)
 

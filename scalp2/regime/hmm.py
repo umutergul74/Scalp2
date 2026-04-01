@@ -371,6 +371,142 @@ class RegimeDetector:
                 internal_covars.copy() + self.model.means_ ** 2
             ) * w
 
+    # ── Health monitoring ──────────────────────────────────────────────
+
+    # Minimum fraction of total N any single state must hold
+    _MIN_STATE_WEIGHT_FRAC = 0.02  # 2% — below this we redistribute
+    # Absolute floor for SS values (below this = numerical underflow)
+    _SS_UNDERFLOW_THRESHOLD = 1e-100
+    # Maximum ratio between largest and smallest N before alarm
+    _MAX_N_RATIO = 50.0
+
+    def health_check(self) -> dict:
+        """Check HMM online stats for collapse symptoms.
+
+        Returns:
+            dict with keys:
+                'healthy': bool — True if no issues detected.
+                'issues': list[str] — Human-readable issue descriptions.
+                'collapsed': bool — True if irrecoverable collapse.
+        """
+        result = {'healthy': True, 'issues': [], 'collapsed': False}
+
+        if not hasattr(self, '_online_stats'):
+            return result
+
+        stats = self._online_stats
+        n_states = self.config.n_states
+        total_n = stats.N.sum()
+
+        if total_n < 1e-10:
+            result['healthy'] = False
+            result['collapsed'] = True
+            result['issues'].append(
+                f'Total N is near zero ({total_n:.2e}) — all states dead'
+            )
+            return result
+
+        # Check N imbalance
+        n_min, n_max = stats.N.min(), stats.N.max()
+        if n_min < 1e-10:
+            ratio = float('inf')
+        else:
+            ratio = n_max / n_min
+
+        if ratio > self._MAX_N_RATIO:
+            result['healthy'] = False
+            result['issues'].append(
+                f'N imbalance: max/min ratio = {ratio:.1f} '
+                f'(N = [{stats.N[0]:.2f}, {stats.N[1]:.2f}, {stats.N[2]:.2f}])'
+            )
+
+        # Check SS underflow
+        if stats.SX is not None:
+            # Full covariance: check SX diagonals
+            for s in range(n_states):
+                diag = np.diag(stats.SX[s]) if stats.SX[s].ndim == 2 else stats.SX[s]
+                if np.any(np.abs(diag) < self._SS_UNDERFLOW_THRESHOLD):
+                    result['healthy'] = False
+                    result['collapsed'] = True
+                    result['issues'].append(
+                        f'State {s} SX diagonal underflowed '
+                        f'(min={np.abs(diag).min():.2e})'
+                    )
+        else:
+            for s in range(n_states):
+                if np.any(np.abs(stats.SS[s]) < self._SS_UNDERFLOW_THRESHOLD):
+                    result['healthy'] = False
+                    result['collapsed'] = True
+                    result['issues'].append(
+                        f'State {s} SS underflowed '
+                        f'(min={np.abs(stats.SS[s]).min():.2e})'
+                    )
+
+        # Check state fractions
+        fracs = stats.N / total_n
+        for s in range(n_states):
+            if fracs[s] < self._MIN_STATE_WEIGHT_FRAC:
+                result['healthy'] = False
+                result['issues'].append(
+                    f'State {s} starving: {fracs[s]*100:.2f}% of total weight'
+                )
+
+        return result
+
+    def _enforce_state_floor(self) -> None:
+        """Redistribute weight to prevent any state from dying.
+
+        If a state's N drops below MIN_FRAC of total, steal weight from
+        the dominant state and give it to the starving one. This prevents
+        the positive feedback loop that causes collapse.
+        """
+        stats = self._online_stats
+        total_n = stats.N.sum()
+        if total_n < 1e-10:
+            return
+
+        min_weight = total_n * self._MIN_STATE_WEIGHT_FRAC
+        dominant = int(np.argmax(stats.N))
+
+        for s in range(self.config.n_states):
+            if s == dominant:
+                continue
+            if stats.N[s] < min_weight:
+                deficit = min_weight - stats.N[s]
+                # Transfer from dominant to starving state
+                transfer_frac = deficit / (stats.N[dominant] + 1e-10)
+                transfer_frac = min(transfer_frac, 0.1)  # cap at 10%
+                actual_transfer = stats.N[dominant] * transfer_frac
+
+                stats.N[s] += actual_transfer
+                stats.N[dominant] -= actual_transfer
+
+                # Also transfer proportional S and SX
+                stats.S[s] += stats.S[dominant] * transfer_frac
+                stats.S[dominant] *= (1 - transfer_frac)
+
+                if stats.SX is not None:
+                    stats.SX[s] += stats.SX[dominant] * transfer_frac
+                    stats.SX[dominant] *= (1 - transfer_frac)
+                else:
+                    stats.SS[s] += stats.SS[dominant] * transfer_frac
+                    stats.SS[dominant] *= (1 - transfer_frac)
+
+                logger.warning(
+                    'HMM state floor: redistributed %.2f weight from '
+                    'state %d → state %d (N was %.4f, now %.4f)',
+                    actual_transfer, dominant, s,
+                    stats.N[s] - actual_transfer, stats.N[s],
+                )
+
+    def reset_online_stats(self) -> None:
+        """Reset online stats to trained model parameters.
+
+        Call this when health_check reports a collapse.
+        """
+        logger.warning('HMM online stats RESET to trained parameters')
+        self._init_online_stats()
+
     def update_online(self, df: pd.DataFrame) -> bool:
         """Update HMM parameters with new data using exponential decay.
 
@@ -438,13 +574,18 @@ class RegimeDetector:
         stats.total_bars_seen += n_new
         stats.bars_since_update += n_new
 
+        # 5b. Enforce minimum state weight (prevent collapse)
+        self._enforce_state_floor()
+
         # Progress log every 24 bars (~6 hours)
         if stats.total_bars_seen % 24 == 0 or stats.total_bars_seen <= 2:
             logger.info(
-                "HMM online: %d/%d bars collected (next update at %d)",
+                "HMM online: %d/%d bars collected (next update at %d), "
+                "N=[%.2f, %.2f, %.2f]",
                 stats.total_bars_seen,
                 self.config.online_min_samples,
                 self.config.online_update_interval,
+                stats.N[0], stats.N[1], stats.N[2],
             )
 
         # 6. Re-estimate if enough data accumulated
@@ -453,6 +594,18 @@ class RegimeDetector:
             stats.total_bars_seen >= self.config.online_min_samples
             and stats.bars_since_update >= self.config.online_update_interval
         ):
+            # Health check before re-estimating
+            health = self.health_check()
+            if health['collapsed']:
+                logger.critical(
+                    'HMM COLLAPSED before re-estimation! Issues: %s. '
+                    'Auto-resetting to trained parameters.',
+                    health['issues'],
+                )
+                self.reset_online_stats()
+                stats.bars_since_update = 0
+                return False
+
             self._reestimate_from_stats()
             stats.bars_since_update = 0
             updated = True
