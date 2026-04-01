@@ -1204,7 +1204,7 @@ for i in tqdm(range(n_fwd_bars), desc='Forward Test'):
     if atr < 1e-10:
         fwd_skip['no_atr'] += 1
         continue
-    adx_val = row['adx_14'] if 'adx_14' in df_fwd_bt.columns else 999.0
+    adx_val = row['adx'] if 'adx' in df_fwd_bt.columns else 999.0
     if adx_val < MIN_ADX:
         fwd_skip['low_adx'] += 1
         continue
@@ -1407,7 +1407,7 @@ for i in range(sig_start_idx, n_sig_bars):
     if atr < 1e-10:
         continue
 
-    adx_val = row['adx_14'] if 'adx_14' in df_sig.columns else 999.0
+    adx_val = row['adx'] if 'adx' in df_sig.columns else 999.0
     if adx_val < MIN_ADX:
         continue
 
