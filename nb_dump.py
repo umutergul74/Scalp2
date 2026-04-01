@@ -308,6 +308,16 @@ for fold_data in tqdm(wf_predictions, desc='Backtesting folds'):
             direction = ps['direction']
             confidence = ps['confidence']
 
+            # Enforce Consecutive SL Protection (Matches Live Bot)
+            can_enter, skip_reason = trade_mgr.can_enter_trade(
+                direction=direction,
+                entry_price=entry_price,
+                current_atr=atr,
+            )
+            if not can_enter:
+                skip_reasons['sl_block'] = skip_reasons.get('sl_block', 0) + 1
+                continue
+
             # Recompute SL from actual entry price
             if direction == "LONG":
                 sl = entry_price - label_cfg.sl_multiplier * atr
@@ -1507,3 +1517,143 @@ else:
     print(sig_df.to_string(index=False))
     pd.reset_option('display.max_rows')
     pd.reset_option('display.max_colwidth')
+
+# ============================================================
+# FULL REPORT EXPORT — Saves ALL metrics to a single JSON file
+# ============================================================
+import json as _json
+from datetime import datetime as _dt
+
+_report = {
+    "generated_at": _dt.now(timezone.utc).isoformat(),
+    "leverage": LEVERAGE,
+    "config": {
+        "confidence_threshold": exec_cfg.confidence_threshold,
+        "min_adx": MIN_ADX,
+        "min_atr_percentile": MIN_ATR_PCTILE,
+        "choppy_threshold": CHOPPY_THRESHOLD,
+        "sl_multiplier": label_cfg.sl_multiplier,
+        "full_tp_atr": trade_mgmt_cfg.full_tp_atr,
+        "partial_tp_1_atr": trade_mgmt_cfg.partial_tp_1_atr,
+        "partial_tp_1_pct": trade_mgmt_cfg.partial_tp_1_pct,
+        "kelly_fraction": kelly_fraction,
+        "kelly_max": kelly_max,
+        "kelly_b": kelly_b,
+    },
+}
+
+# --- Walk-Forward Backtest ---
+if len(trades_df) > 0:
+    _net = trades_df['net_pnl'].values
+    _gross = trades_df['gross_pnl'].values
+    _wins = _net[_net > 0]
+    _losses = _net[_net < 0]
+
+    trades_df['date'] = pd.to_datetime(trades_df['timestamp']).dt.date
+    _daily = trades_df.groupby('date')['net_pnl'].sum()
+    _full_range = pd.date_range(_daily.index.min(), _daily.index.max(), freq='D')
+    _daily = _daily.reindex(_full_range, fill_value=0.0)
+    _cum = np.cumsum(_daily.values)
+    _peak = np.maximum.accumulate(_cum)
+    _dd = _peak - _cum
+
+    _report["walkforward"] = {
+        "total_trades": len(trades_df),
+        "win_rate": round(len(_wins) / len(_net), 4),
+        "profit_factor": round(abs(_wins.sum() / _losses.sum()), 4) if len(_losses) > 0 else None,
+        "expectancy_pct": round(float(_net.mean() * 100), 4),
+        "avg_win_pct": round(float(_wins.mean() * 100), 4) if len(_wins) else 0,
+        "avg_loss_pct": round(float(_losses.mean() * 100), 4) if len(_losses) else 0,
+        "avg_bars_held": round(float(trades_df['bars_held'].mean()), 1),
+        "daily_sharpe": round(float(_daily.mean() / (_daily.std() + 1e-10) * np.sqrt(365)), 4),
+        "max_drawdown_pct": round(float(_dd.max() * 100), 4),
+        "gross_pnl_pct": round(float(_gross.sum() * 100), 2),
+        "net_pnl_pct": round(float(_net.sum() * 100), 2),
+        "cost_impact_pct": round(float((_gross.sum() - _net.sum()) * 100), 2),
+        "close_reasons": trades_df['status'].value_counts().to_dict(),
+        "skip_reasons": skip_reasons,
+    }
+
+    # Yearly
+    trades_df['year'] = pd.to_datetime(trades_df['timestamp']).dt.year
+    _yearly = []
+    for _y, _grp in trades_df.groupby('year'):
+        _yn = _grp['net_pnl'].values
+        _yw = _yn[_yn > 0]
+        _yl = _yn[_yn < 0]
+        _ywr = len(_yw) / len(_yn) if len(_yn) > 0 else 0
+        _ypf = abs(_yw.sum() / _yl.sum()) if len(_yl) > 0 else None
+        _yd = _grp.groupby(_grp['timestamp'].apply(lambda x: pd.to_datetime(x).date()))['net_pnl'].sum()
+        _ydr = pd.date_range(_yd.index.min(), _yd.index.max(), freq='D')
+        _yd = _yd.reindex(_ydr, fill_value=0.0)
+        _ysh = float(_yd.mean() / (_yd.std() + 1e-10) * np.sqrt(365))
+        _yc = np.cumsum(_yd.values)
+        _yp = np.maximum.accumulate(_yc)
+        _ymdd = float((_yp - _yc).max() * 100)
+        _yearly.append({
+            "year": int(_y), "trades": len(_grp),
+            "win_rate": round(_ywr, 4), "profit_factor": round(_ypf, 4) if _ypf else None,
+            "sharpe": round(_ysh, 2), "net_pnl_pct": round(float(_yn.sum() * 100), 2),
+            "max_drawdown_pct": round(_ymdd, 2),
+        })
+    _report["yearly"] = _yearly
+
+    # Quarterly
+    trades_df['quarter'] = pd.to_datetime(trades_df['timestamp']).dt.to_period('Q')
+    _quarterly = []
+    for _q, _grp in trades_df.groupby('quarter'):
+        _qn = _grp['net_pnl'].values
+        _qw = _qn[_qn > 0]
+        _ql = _qn[_qn < 0]
+        _quarterly.append({
+            "quarter": str(_q), "trades": len(_grp),
+            "win_rate": round(len(_qw) / len(_qn), 4) if len(_qn) > 0 else 0,
+            "profit_factor": round(abs(_qw.sum() / _ql.sum()), 4) if len(_ql) > 0 else None,
+            "net_pnl_pct": round(float(_qn.sum() * 100), 2),
+        })
+    _report["quarterly"] = _quarterly
+
+    # Monthly
+    trades_df['month'] = pd.to_datetime(trades_df['timestamp']).dt.to_period('M')
+    _monthly = []
+    for _m, _grp in trades_df.groupby('month'):
+        _mn = _grp['net_pnl'].values
+        _monthly.append({
+            "month": str(_m), "trades": len(_grp),
+            "net_pnl_pct": round(float(_mn.sum() * 100), 2),
+        })
+    _report["monthly"] = _monthly
+
+# --- Forward Test ---
+if 'fwd_df' in dir() and len(fwd_df) > 0:
+    _fn = fwd_df['net_pnl'].values
+    _fw = _fn[_fn > 0]
+    _fl = _fn[_fn < 0]
+    _report["forward_test"] = {
+        "period": f"{FWD_TEST_CUTOFF} → {df_fwd_bt.index[-1].strftime('%Y-%m-%d')}",
+        "total_trades": len(fwd_df),
+        "win_rate": round(len(_fw) / len(_fn), 4),
+        "profit_factor": round(abs(_fw.sum() / _fl.sum()), 4) if len(_fl) > 0 else None,
+        "expectancy_pct": round(float(_fn.mean() * 100), 4),
+        "daily_sharpe": round(float(fwd_sharpe), 4),
+        "max_drawdown_pct": round(float(fwd_mdd * 100), 4),
+        "net_pnl_pct": round(float(_fn.sum() * 100), 2),
+        "skip_reasons": fwd_skip,
+    }
+    # Weekly
+    fwd_df['week'] = pd.to_datetime(fwd_df['timestamp']).dt.to_period('W')
+    _fweekly = []
+    for _w, _grp in fwd_df.groupby('week'):
+        _wn = _grp['net_pnl'].values
+        _fweekly.append({
+            "week": str(_w), "trades": len(_grp),
+            "net_pnl_pct": round(float(_wn.sum() * 100), 2),
+        })
+    _report["forward_weekly"] = _fweekly
+
+# Save
+_report_path = '/content/drive/MyDrive/scalp2/data/processed/backtest_report.json'
+with open(_report_path, 'w', encoding='utf-8') as _f:
+    _json.dump(_report, _f, indent=2, ensure_ascii=False, default=str)
+print(f'\n✅ Full report saved to: {_report_path}')
+print(f'   Size: {os.path.getsize(_report_path) / 1024:.1f} KB')
