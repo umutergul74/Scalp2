@@ -313,7 +313,10 @@ class LiveBot:
                 indicators=indicators,
             )
             # CSV log
-            self._log_cycle_csv(now_key, price, atr, atr_pct, adx, "NO_TRADE", reason)
+            self._log_cycle_csv(
+                now_key, price, atr, atr_pct, adx, "NO_TRADE", reason,
+                confidence=signal.confidence, probs=signal.probabilities
+            )
             # Online HMM update even when no trade
             self._try_online_hmm_update(data)
             return
@@ -334,6 +337,7 @@ class LiveBot:
         self._log_cycle_csv(
             now_key, price, atr, atr_pct, adx, direction, "SIGNAL",
             signal.confidence, signal.entry_price, signal.stop_loss, signal.take_profit,
+            probs=signal.probabilities,
         )
         await self._execute_signal(signal, data["current_atr"])
 
@@ -760,11 +764,17 @@ class LiveBot:
         entry: float | None = None,
         sl: float | None = None,
         tp: float | None = None,
+        probs: dict | None = None,
     ) -> None:
         """Append one row to cycle_history.csv."""
         import csv
         csv_path = self.state_dir / "cycle_history.csv"
         write_header = not csv_path.exists()
+        
+        prob_short = f"{probs['short']:.3f}" if probs and "short" in probs else ""
+        prob_hold = f"{probs['hold']:.3f}" if probs and "hold" in probs else ""
+        prob_long = f"{probs['long']:.3f}" if probs and "long" in probs else ""
+        
         try:
             with open(csv_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -772,6 +782,7 @@ class LiveBot:
                     writer.writerow([
                         "time", "price", "atr", "atr_pct", "adx",
                         "signal", "reason", "confidence", "entry", "sl", "tp",
+                        "prob_short", "prob_hold", "prob_long"
                     ])
                 writer.writerow([
                     time_str,
@@ -781,10 +792,11 @@ class LiveBot:
                     f"{adx:.1f}",
                     signal,
                     reason,
-                    f"{confidence:.3f}" if confidence else "",
-                    f"{entry:.1f}" if entry else "",
-                    f"{sl:.1f}" if sl else "",
-                    f"{tp:.1f}" if tp else "",
+                    f"{confidence:.3f}" if confidence is not None else "",
+                    f"{entry:.1f}" if entry is not None else "",
+                    f"{sl:.1f}" if sl is not None else "",
+                    f"{tp:.1f}" if tp is not None else "",
+                    prob_short, prob_hold, prob_long,
                 ])
         except Exception as e:
             logger.warning("CSV log error: %s", e)
