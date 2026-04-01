@@ -1057,7 +1057,7 @@ print("\n=== FORWARD DIAGNOSTICS COMPLETE ===")
 # Forward Test Step 3: Backtest only on bars AFTER training cutoff
 # ============================================================
 # --- Forward test: düşük threshold ile test ---
-FWD_CONFIDENCE_THRESHOLD = 0.40  # Normal: 0.70, test amaçlı düşürüldü
+FWD_CONFIDENCE_THRESHOLD = exec_cfg.confidence_threshold  # Same as live bot
 
 df_fwd_bt = df_fwd_full.iloc[seq_len:seq_len + fwd_min].copy()
 
@@ -1093,7 +1093,8 @@ fwd_equity = [0.0]
 fwd_cum_pnl = 0.0
 fwd_skip = {'low_adx': 0, 'low_volatility': 0, 'low_conf': 0,
             'hold': 0, 'daily_cap': 0, 'no_atr': 0, 'choppy': 0,
-            'no_next_bar': 0, 'warmup': 0}
+            'no_next_bar': 0, 'warmup': 0, 'regime_direction': 0,
+            'sl_protection': 0, 'time_blocked': 0}
 
 fwd_trade_mgr = TradeManager(trade_mgmt_cfg, label_cfg.max_holding_bars)
 fwd_active = None
@@ -1196,7 +1197,7 @@ for i in tqdm(range(n_fwd_bars), desc='Forward Test'):
     if tdf and tdf.enabled:
         hr = row.name.hour if hasattr(row.name, 'hour') else pd.to_datetime(row.name).hour
         if hr in tdf.blocked_hours_utc:
-            fwd_skip['choppy'] += 1  # Count as choppy skip or time skip
+            fwd_skip['time_blocked'] += 1
             continue
 
     atr = row['atr_14'] if 'atr_14' in df_fwd_bt.columns else 0.0
@@ -1218,8 +1219,34 @@ for i in tqdm(range(n_fwd_bars), desc='Forward Test'):
         fwd_skip['no_next_bar'] += 1
         continue
 
+    direction = "LONG" if cls == 2 else "SHORT"
+
+    # Regime-direction filter (same as live bot)
+    if exec_cfg.regime_direction_filter and i < len(fwd_regime):
+        bull_prob = fwd_regime[i, 0]
+        bear_prob = fwd_regime[i, 1]
+        dominant_regime = int(np.argmax(fwd_regime[i]))
+        # Bull regime (0) blocks SHORT, Bear regime (1) blocks LONG
+        if dominant_regime == 0 and direction == "SHORT":
+            fwd_skip['regime_direction'] += 1
+            continue
+        if dominant_regime == 1 and direction == "LONG":
+            fwd_skip['regime_direction'] += 1
+            continue
+
+    # Consecutive SL protection (same as live bot)
+    if fwd_trade_mgr.can_enter_trade is not None:
+        can_enter, skip_reason = fwd_trade_mgr.can_enter_trade(
+            direction=direction,
+            entry_price=row['close'],
+            current_atr=atr,
+        )
+        if not can_enter:
+            fwd_skip['sl_protection'] += 1
+            continue
+
     fwd_pending = {
-        'direction': "LONG" if cls == 2 else "SHORT",
+        'direction': direction,
         'atr': atr,
         'confidence': max(p[0], p[2]),
     }
