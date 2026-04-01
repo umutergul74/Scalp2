@@ -145,8 +145,8 @@ regime:
   choppy_threshold: 0.65
   online_update_enabled: true
   online_decay_factor: 0.995
-  online_update_interval: 96
-  online_min_samples: 192
+  online_update_interval: 48
+  online_min_samples: 96
 
 execution:
   time_of_day_filter:
