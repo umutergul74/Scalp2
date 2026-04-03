@@ -379,6 +379,10 @@ class RegimeDetector:
     _SS_UNDERFLOW_THRESHOLD = 1e-100
     # Maximum ratio between largest and smallest N before alarm
     _MAX_N_RATIO = 50.0
+    # Minimum transition probability floor (prevents transition death)
+    _MIN_TRANS_FRAC = 0.005  # 0.5% — any transition must have at least this prob
+    # Minimum off-diagonal transition count ratio before warning
+    _MIN_TRANS_COUNT_RATIO = 1e-4
 
     def health_check(self) -> dict:
         """Check HMM online stats for collapse symptoms.
@@ -420,7 +424,7 @@ class RegimeDetector:
                 f'(N = [{stats.N[0]:.2f}, {stats.N[1]:.2f}, {stats.N[2]:.2f}])'
             )
 
-        # Check SS underflow
+        # Check SS / SX underflow
         if stats.SX is not None:
             # Full covariance: check SX diagonals
             for s in range(n_states):
@@ -451,6 +455,28 @@ class RegimeDetector:
                     f'State {s} starving: {fracs[s]*100:.2f}% of total weight'
                 )
 
+        # Check transition matrix degeneration
+        row_sums = stats.trans_counts.sum(axis=1)
+        for i in range(n_states):
+            if row_sums[i] < 1e-10:
+                result['healthy'] = False
+                result['collapsed'] = True
+                result['issues'].append(
+                    f'Transition row {i} has zero total count'
+                )
+                continue
+            for j in range(n_states):
+                if i == j:
+                    continue
+                trans_prob = stats.trans_counts[i, j] / row_sums[i]
+                if trans_prob < self._MIN_TRANS_COUNT_RATIO:
+                    result['healthy'] = False
+                    result['issues'].append(
+                        f'Transition {i}->{j} degenerated: '
+                        f'prob={trans_prob:.2e}, '
+                        f'count={stats.trans_counts[i, j]:.2e}'
+                    )
+
         return result
 
     def _enforce_state_floor(self) -> None:
@@ -459,8 +485,12 @@ class RegimeDetector:
         If a state's N drops below MIN_FRAC of total, steal weight from
         the dominant state and give it to the starving one. This prevents
         the positive feedback loop that causes collapse.
+
+        Also floors transition counts to prevent any transition path
+        from dying (which causes the forward pass to get stuck).
         """
         stats = self._online_stats
+        n_states = self.config.n_states
         total_n = stats.N.sum()
         if total_n < 1e-10:
             return
@@ -468,7 +498,7 @@ class RegimeDetector:
         min_weight = total_n * self._MIN_STATE_WEIGHT_FRAC
         dominant = int(np.argmax(stats.N))
 
-        for s in range(self.config.n_states):
+        for s in range(n_states):
             if s == dominant:
                 continue
             if stats.N[s] < min_weight:
@@ -494,10 +524,39 @@ class RegimeDetector:
 
                 logger.warning(
                     'HMM state floor: redistributed %.2f weight from '
-                    'state %d → state %d (N was %.4f, now %.4f)',
+                    'state %d -> state %d (N was %.4f, now %.4f)',
                     actual_transfer, dominant, s,
                     stats.N[s] - actual_transfer, stats.N[s],
                 )
+
+        # -- Transition count floor ------------------------------------
+        # Prevent any transition path from dying. If trans_counts[i][j]
+        # falls below MIN_TRANS_FRAC of the row sum, redistribute from
+        # the self-transition count. This breaks the positive feedback
+        # loop where dead transitions -> stuck forward pass -> no gamma
+        # for that transition -> stays dead forever.
+        for i in range(n_states):
+            row_sum = stats.trans_counts[i].sum()
+            if row_sum < 1e-10:
+                # Row is dead -- reinitialize uniformly
+                stats.trans_counts[i] = total_n / (n_states * n_states)
+                logger.warning(
+                    'HMM trans floor: row %d was dead, reinitialized', i
+                )
+                continue
+            floor = row_sum * self._MIN_TRANS_FRAC
+            for j in range(n_states):
+                if i == j:
+                    continue
+                if stats.trans_counts[i, j] < floor:
+                    deficit = floor - stats.trans_counts[i, j]
+                    stats.trans_counts[i, j] = floor
+                    stats.trans_counts[i, i] -= deficit  # take from self-transition
+                    logger.debug(
+                        'HMM trans floor: boosted trans[%d->%d] to %.4f '
+                        '(took %.4f from self-transition)',
+                        i, j, floor, deficit,
+                    )
 
     def reset_online_stats(self) -> None:
         """Reset online stats to trained model parameters.
@@ -554,19 +613,24 @@ class RegimeDetector:
         batch_decay = decay**n_new
         stats.N *= batch_decay
         stats.S *= batch_decay
-        stats.SS *= batch_decay
         stats.trans_counts *= batch_decay
         if stats.SX is not None:
             stats.SX *= batch_decay
+            # Note: SS is NOT decayed in full-cov mode — SX is used for
+            # re-estimation, SS is vestigial. Decaying it caused underflow
+            # to 1e-220 which, while harmless, was confusing.
+        else:
+            stats.SS *= batch_decay
 
         for t in range(n_new):
             g = gamma[t]
             x = X_scaled[t]
             stats.N += g
             stats.S += g[:, None] * x[None, :]
-            stats.SS += g[:, None] * (x[None, :] ** 2)
             if stats.SX is not None:
                 stats.SX += g[:, None, None] * np.outer(x, x)[None, :, :]
+            else:
+                stats.SS += g[:, None] * (x[None, :] ** 2)
 
             if t > 0:
                 stats.trans_counts += np.outer(gamma[t - 1], gamma[t])
@@ -642,9 +706,11 @@ class RegimeDetector:
             new_covars = stats.SS / (stats.N[:, None] + eps) - new_means**2
             new_covars = np.maximum(new_covars, self.model.min_covar)
 
-        # Transition matrix
-        row_sums = stats.trans_counts.sum(axis=1, keepdims=True) + eps
-        new_transmat = stats.trans_counts / row_sums
+        # Transition matrix — Dirichlet smoothing to prevent zero transitions
+        alpha = 0.01  # pseudo-count per cell
+        smoothed_counts = stats.trans_counts + alpha
+        row_sums = smoothed_counts.sum(axis=1, keepdims=True) + eps
+        new_transmat = smoothed_counts / row_sums
 
         # Smooth blend: 30% new + 70% old
         self.model.means_ = (1 - blend) * self.model.means_ + blend * new_means
