@@ -284,11 +284,12 @@ class Stage1Trainer:
 
             with autocast('cuda', enabled=self.use_amp):
                 logits, latent = self.model(batch_x)
+                projected = self.model.contrastive_project(latent)
                 loss, _ = compute_combined_loss(
                     logits, batch_y, batch_r,
                     class_weights, alpha, self.aux_loss_fn,
                     contrastive_loss_fn=self.contrastive_loss_fn,
-                    latent=latent,
+                    latent=projected,
                     contrastive_weight=self.contrastive_weight,
                     label_smoothing=self.label_smoothing,
                 )
@@ -325,11 +326,12 @@ class Stage1Trainer:
 
             with autocast('cuda', enabled=self.use_amp):
                 logits, latent = self.model(batch_x)
+                projected = self.model.contrastive_project(latent)
                 loss, _ = compute_combined_loss(
                     logits, batch_y, batch_r,
                     class_weights, alpha, self.aux_loss_fn,
                     contrastive_loss_fn=self.contrastive_loss_fn,
-                    latent=latent,
+                    latent=projected,
                     contrastive_weight=self.contrastive_weight,
                     label_smoothing=self.label_smoothing,
                 )
