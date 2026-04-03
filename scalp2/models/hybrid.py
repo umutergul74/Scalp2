@@ -1,4 +1,4 @@
-"""Hybrid TCN+GRU encoder — parallel feature extraction with fusion."""
+"""Hybrid TCN+GRU encoder — parallel feature extraction with information bottleneck."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from scalp2.models.tcn import TCNEncoder
 
 
 class HybridEncoder(nn.Module):
-    """Two-stage hybrid architecture: parallel TCN + GRU → fusion → classifier.
+    """Two-stage hybrid architecture: parallel TCN + GRU → bottleneck → classifier.
 
     Architecture:
         Input (B, seq_len, n_features)
@@ -20,11 +20,17 @@ class HybridEncoder(nn.Module):
                         ↓
             Concatenate → (B, 192)
                         ↓
-            Linear(192, 128) → LayerNorm → ReLU → Dropout(0.3) → (B, 128)
+            Information Bottleneck:
+            Linear(192, 64) → LayerNorm → GELU → Dropout(0.4)     [compress]
+            Linear(64, 128)  → LayerNorm → GELU → Dropout(0.4)     [expand]
                         ↓ (latent vector for XGBoost meta-learner)
             Linear(128, 3) → (B, 3) logits [short, hold, long]
 
-    Total parameters: ~315K (deliberately small to prevent overfitting).
+    The bottleneck (192→64→128) forces the model to discard noise and
+    keep only the most informative patterns. Without it, the model
+    can pass noise straight through to the latent space.
+
+    Total parameters: ~330K (deliberately small to prevent overfitting).
     """
 
     def __init__(self, n_features: int, config: ModelConfig):
@@ -35,6 +41,9 @@ class HybridEncoder(nn.Module):
             num_channels=config.tcn.num_channels,
             kernel_size=config.tcn.kernel_size,
             dropout=config.tcn.dropout,
+            spatial_dropout=config.tcn.spatial_dropout,
+            squeeze_excite=config.tcn.squeeze_excite,
+            stochastic_depth=config.tcn.stochastic_depth,
         )
 
         self.gru = GRUEncoder(
@@ -43,19 +52,29 @@ class HybridEncoder(nn.Module):
             num_layers=config.gru.num_layers,
             dropout=config.gru.dropout,
             bidirectional=config.gru.bidirectional,
+            attention_pooling=config.gru.attention_pooling,
         )
 
         fusion_input_dim = self.tcn.output_dim + self.gru.output_dim
+        bottleneck_dim = config.fusion.bottleneck_dim
+        latent_dim = config.fusion.latent_dim
 
+        # Information Bottleneck: compress → expand
         self.projection = nn.Sequential(
-            nn.Linear(fusion_input_dim, config.fusion.latent_dim),
-            nn.LayerNorm(config.fusion.latent_dim),
-            nn.ReLU(),
+            # Compress: force noise removal
+            nn.Linear(fusion_input_dim, bottleneck_dim),
+            nn.LayerNorm(bottleneck_dim),
+            nn.GELU(),
+            nn.Dropout(config.fusion.dropout),
+            # Expand: reconstruct meaningful representation
+            nn.Linear(bottleneck_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
             nn.Dropout(config.fusion.dropout),
         )
 
-        self.classifier = nn.Linear(config.fusion.latent_dim, 3)
-        self.latent_dim = config.fusion.latent_dim
+        self.classifier = nn.Linear(latent_dim, 3)
+        self.latent_dim = latent_dim
 
     def forward(
         self, x: torch.Tensor

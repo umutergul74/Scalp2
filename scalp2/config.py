@@ -115,21 +115,26 @@ class LabelConfig:
 class TCNConfig:
     num_channels: List[int] = field(default_factory=lambda: [64, 64, 64, 64])
     kernel_size: int = 3
-    dropout: float = 0.2
+    dropout: float = 0.3
+    spatial_dropout: bool = True
+    squeeze_excite: bool = True
+    stochastic_depth: float = 0.1
 
 
 @dataclass
 class GRUConfig:
     hidden_size: int = 128
     num_layers: int = 2
-    dropout: float = 0.2
+    dropout: float = 0.3
     bidirectional: bool = False
+    attention_pooling: bool = True
 
 
 @dataclass
 class FusionConfig:
     latent_dim: int = 128
-    dropout: float = 0.3
+    bottleneck_dim: int = 64
+    dropout: float = 0.4
 
 
 @dataclass
@@ -167,16 +172,19 @@ class ModelConfig:
 class OptimizerConfig:
     type: str = "AdamW"
     lr: float = 1e-3
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-4
     betas: List[float] = field(default_factory=lambda: [0.9, 0.999])
 
 
 @dataclass
 class SchedulerConfig:
-    type: str = "ReduceLROnPlateau"
+    type: str = "CosineAnnealingWarmRestarts"
     patience: int = 5
     factor: float = 0.5
     min_lr: float = 1e-6
+    T_0: int = 10
+    T_mult: int = 2
+    warmup_epochs: int = 3
 
 
 @dataclass
@@ -192,6 +200,9 @@ class LossConfig:
     alpha_start: float = 1.0
     alpha_end: float = 0.5
     alpha_anneal_epochs: int = 20
+    label_smoothing: float = 0.1
+    contrastive_weight: float = 0.15
+    contrastive_temp: float = 0.07
 
 
 @dataclass

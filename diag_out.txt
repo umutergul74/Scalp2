@@ -1,0 +1,105 @@
+======================================================================
+HMM ONLINE STATS DIAGNOSTIC
+======================================================================
+
+total_bars_seen = 144
+bars_since_update = 0
+
+--- N (state weights) ---
+  State 0: N = 48.5108  (24.7%)
+  State 1: N = 116.5063  (59.4%)
+  State 2: N = 31.0959  (15.9%)
+  Total: 196.1130
+  Max/Min ratio: 3.75
+
+--- SS (sum-of-squares, diag) ---
+  State 0: [24.88420735  6.06240859 32.7764046  11.83041057 33.17178747]
+    min abs = 6.06e+00, max abs = 3.32e+01
+  State 1: [ 30.68448407   0.61998886  28.18971568 122.18593682  54.92035207]
+    min abs = 6.20e-01, max abs = 1.22e+02
+  State 2: [6.44297840e-221 1.36647216e-220 3.33481828e-220 2.89892826e-220
+ 6.82026291e-220]
+    min abs = 6.44e-221, max abs = 6.82e-220
+
+--- SX (outer product sums, full cov) ---
+  State 0 diagonal: [56.58938558  6.6480098  43.2134531  48.38295121 70.54958496]
+    min abs = 6.65e+00
+  State 1 diagonal: [ 39.47101757   2.19220441  49.21433831 141.77973311  73.5379511 ]
+    min abs = 2.19e+00
+  State 2 diagonal: [129.5596678  312.12878386 176.59861348  57.03838831  57.49188212]
+    min abs = 5.70e+01
+
+======================================================================
+ROOT CAUSE ANALYSIS
+======================================================================
+
+Decay factor per bar: 0.995
+Bars seen: 144
+
+Decay^144 = 4.86e-01
+Decay^144 = 4.86e-01
+Cumulative decay after 144 bars: 0.485874
+
+--- KEY INSIGHT ---
+0.995^144 = 0.485874
+This is ~0.49, NOT 1e-220.
+So pure decay cannot explain SS = 1e-220 after 144 bars.
+
+The SS is initialized to ZERO for full covariance mode!
+Look at _init_online_stats line 354:
+  SS = np.zeros((n_states, n_features))  # "unused for full"
+
+So SS starts at 0.0, and the only update is:
+  SS += g[:, None] * (x^2)
+  SS *= batch_decay  (each bar)
+
+--- SIMULATION: SS accumulation for a starving state ---
+  After 144 bars (starving gamma=0.001 then 0.2): SS min = 7.980198
+  This is reasonable, NOT 1e-220
+
+--- What could produce SS = 6.4e-221? ---
+  SS = 6.4e-221 means gamma for state 2 was essentially 0
+  across ALL 144 bars (forward pass never assigned any
+  responsibility to state 2)
+
+--- THE BUG: _enforce_state_floor doesn't protect SS! ---
+  _enforce_state_floor transfers N and S and SX/SS proportionally
+  BUT: with covariance_type='full', it transfers SX, not SS
+  Line 488-490: if stats.SX is not None -> transfers SX
+  Line 492-493: else -> transfers SS
+  So SS is NEVER protected in full-covariance mode!
+
+  Meanwhile, SS is still decayed every bar (line 557):
+    stats.SS *= batch_decay
+  And only receives tiny additions (line 567):
+    stats.SS += g * x^2
+
+  If gamma for state 2 is ~1e-300, then:
+    SS += 1e-300 * x^2 (negligible)
+    SS *= 0.995 (shrinks each bar)
+    -> SS approaches 0 via exponential decay from tiny seed
+
+--- Transition matrix tells the story ---
+  State 0: [0.96910957 0.02178652 0.00910391]
+  State 1: [2.29649157e-02 9.76749342e-01 2.85742395e-04]
+  State 2: [4.47552209e-02 5.61564109e-69 9.55244779e-01]
+  State 1->2 transition: 0.028574%
+  State 2->1 transition: 0.000000%
+  State 1->2 count: 0.026656
+  State 2->1 count: 5.24e-67
+
+--- CONCLUSION ---
+  1. SS is init to 0 in full-cov mode (by design, since SX is used)
+  2. SS is decayed every bar (line 557) regardless of cov type
+  3. SS gets += g * x^2, but if gamma->0, this contributes nothing
+  4. The forward pass is STICKY (trans probs ~97% self-transition)
+     so once the market enters State 1, it stays there
+  5. State 2 (choppy) gets gamma->0, so SS->0 via decay
+  6. _enforce_state_floor saves N and SX but NOT SS
+  7. Health check only checks SX diag (which IS protected), NOT SS
+
+  IMPACT: SS underflow is HARMLESS because re-estimation uses SX.
+  But the REAL problem is the sticky transition matrix +
+  forward-only pass = regime detection becomes almost frozen.
+  Once State 1 dominates, the forward pass keeps assigning
+  gamma->State 1, which reinforces the dominance (positive feedback).

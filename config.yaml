@@ -64,17 +64,22 @@ model:
   tcn:
     num_channels: [64, 64, 64, 64]
     kernel_size: 3
-    dropout: 0.2
+    dropout: 0.3
+    spatial_dropout: true
+    squeeze_excite: true
+    stochastic_depth: 0.1
 
   gru:
     hidden_size: 128
     num_layers: 2
-    dropout: 0.2
+    dropout: 0.3
     bidirectional: false
+    attention_pooling: true
 
   fusion:
     latent_dim: 128
-    dropout: 0.3
+    bottleneck_dim: 64
+    dropout: 0.4
 
   xgboost:
     objective: "multi:softprob"
@@ -99,14 +104,17 @@ training:
   optimizer:
     type: "AdamW"
     lr: 1.0e-3
-    weight_decay: 1.0e-4
+    weight_decay: 5.0e-4
     betas: [0.9, 0.999]
 
   scheduler:
-    type: "ReduceLROnPlateau"
+    type: "CosineAnnealingWarmRestarts"
     patience: 5
     factor: 0.5
     min_lr: 1.0e-6
+    T_0: 10
+    T_mult: 2
+    warmup_epochs: 3
 
   batch_size: 256
   max_epochs: 100
@@ -123,6 +131,9 @@ training:
     alpha_start: 1.0
     alpha_end: 0.5
     alpha_anneal_epochs: 20
+    label_smoothing: 0.1
+    contrastive_weight: 0.15
+    contrastive_temp: 0.07
 
   class_weights: "inverse_frequency"
 

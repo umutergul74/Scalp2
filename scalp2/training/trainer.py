@@ -1,8 +1,9 @@
-"""Stage-1 PyTorch training loop — AMP, AdamW, finance-aware loss."""
+"""Stage-1 PyTorch training loop — AMP, AdamW, anti-overfitting, contrastive learning."""
 
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from scalp2.config import TrainingConfig
 from scalp2.data.dataset import ScalpDataset, create_dataloaders
+from scalp2.losses.contrastive_loss import SupConLoss
 from scalp2.losses.log_mdd_loss import LogMDDLoss, compute_combined_loss
 from scalp2.losses.sharpe_loss import SharpeLoss
 from scalp2.models.hybrid import HybridEncoder
@@ -22,15 +24,62 @@ from scalp2.training.callbacks import EarlyStopping, ModelCheckpoint
 logger = logging.getLogger(__name__)
 
 
+class WarmupCosineScheduler:
+    """Linear warmup followed by cosine annealing with warm restarts.
+
+    - First `warmup_epochs` epochs: lr linearly increases from 0 to base_lr.
+    - After warmup: CosineAnnealingWarmRestarts (T_0, T_mult) takes over.
+
+    This prevents the large initial gradients from destroying weights
+    and provides cyclic exploration of the loss landscape.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_epochs: int,
+        T_0: int,
+        T_mult: int,
+        min_lr: float = 1e-6,
+    ):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = optimizer.param_groups[0]["lr"]
+        self.min_lr = min_lr
+        self.current_epoch = 0
+
+        # Main scheduler (starts after warmup)
+        self.cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=T_0, T_mult=T_mult, eta_min=min_lr
+        )
+
+    def step(self, val_loss: float | None = None) -> None:
+        """Step the scheduler."""
+        self.current_epoch += 1
+
+        if self.current_epoch <= self.warmup_epochs:
+            # Linear warmup
+            warmup_factor = self.current_epoch / self.warmup_epochs
+            lr = self.base_lr * warmup_factor
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = lr
+        else:
+            # Cosine annealing (pass epoch offset since warmup end)
+            self.cosine.step(self.current_epoch - self.warmup_epochs)
+
+    def get_last_lr(self) -> float:
+        return self.optimizer.param_groups[0]["lr"]
+
+
 class Stage1Trainer:
     """Training loop for the HybridEncoder (TCN+GRU).
 
     Key features:
-        - AdamW optimizer with weight decay
-        - ReduceLROnPlateau scheduler
+        - AdamW optimizer with increased weight decay (5e-4)
+        - Cosine Annealing with Warm Restarts + linear warmup
         - AMP/FP16 mixed precision for T4 GPU
         - Gradient clipping at max_norm=1.0
-        - Combined CE + finance-aware loss with alpha annealing
+        - Combined CE (label smoothing) + SupCon + finance-aware loss
         - Early stopping and model checkpointing
     """
 
@@ -56,33 +105,54 @@ class Stage1Trainer:
             betas=tuple(config.optimizer.betas),
         )
 
-        # Scheduler
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode="min",
-            patience=config.scheduler.patience,
-            factor=config.scheduler.factor,
-            min_lr=config.scheduler.min_lr,
-        )
+        # Scheduler: Warmup + Cosine Annealing
+        if config.scheduler.type == "CosineAnnealingWarmRestarts":
+            self.scheduler = WarmupCosineScheduler(
+                self.optimizer,
+                warmup_epochs=config.scheduler.warmup_epochs,
+                T_0=config.scheduler.T_0,
+                T_mult=config.scheduler.T_mult,
+                min_lr=config.scheduler.min_lr,
+            )
+        else:
+            # Fallback: ReduceLROnPlateau (backward compatible)
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                patience=config.scheduler.patience,
+                factor=config.scheduler.factor,
+                min_lr=config.scheduler.min_lr,
+            )
 
         # AMP scaler
         self.scaler = GradScaler('cuda', enabled=config.use_amp)
         self.use_amp = config.use_amp
 
-        # Auxiliary loss
+        # Auxiliary finance loss
         if config.loss.auxiliary == "sharpe":
             self.aux_loss_fn = SharpeLoss()
         else:
             self.aux_loss_fn = LogMDDLoss()
 
+        # Contrastive loss
+        self.contrastive_loss_fn = SupConLoss(
+            temperature=config.loss.contrastive_temp
+        )
+        self.contrastive_weight = config.loss.contrastive_weight
+        self.label_smoothing = config.loss.label_smoothing
+
         # Callbacks
         self.checkpoint = ModelCheckpoint(save_dir=checkpoint_dir)
 
         logger.info(
-            "Stage1Trainer initialized: device=%s, AMP=%s, params=%d",
+            "Stage1Trainer initialized: device=%s, AMP=%s, params=%d, "
+            "scheduler=%s, label_smoothing=%.2f, contrastive_weight=%.2f",
             self.device,
             self.use_amp,
             model.count_parameters(),
+            config.scheduler.type,
+            self.label_smoothing,
+            self.contrastive_weight,
         )
 
     def _compute_alpha(self, epoch: int) -> float:
@@ -160,8 +230,12 @@ class Stage1Trainer:
             val_loss = self._validate(val_loader, class_weights, alpha)
             history["val_loss"].append(val_loss)
 
-            # Scheduler
-            self.scheduler.step(val_loss)
+            # Scheduler step
+            if isinstance(self.scheduler, WarmupCosineScheduler):
+                self.scheduler.step()
+            else:
+                self.scheduler.step(val_loss)
+
             current_lr = self.optimizer.param_groups[0]["lr"]
             history["lr"].append(current_lr)
 
@@ -171,7 +245,7 @@ class Stage1Trainer:
             # Log
             if epoch % 5 == 0 or epoch == self.config.max_epochs - 1:
                 logger.info(
-                    "Fold %d Epoch %d/%d: train_loss=%.6f val_loss=%.6f lr=%.2e alpha=%.3f",
+                    "Fold %d Epoch %d/%d: train=%.6f val=%.6f lr=%.2e alpha=%.3f",
                     fold_idx, epoch + 1, self.config.max_epochs,
                     train_loss, val_loss, current_lr, alpha,
                 )
@@ -209,10 +283,14 @@ class Stage1Trainer:
             self.optimizer.zero_grad()
 
             with autocast('cuda', enabled=self.use_amp):
-                logits, _ = self.model(batch_x)
+                logits, latent = self.model(batch_x)
                 loss, _ = compute_combined_loss(
                     logits, batch_y, batch_r,
                     class_weights, alpha, self.aux_loss_fn,
+                    contrastive_loss_fn=self.contrastive_loss_fn,
+                    latent=latent,
+                    contrastive_weight=self.contrastive_weight,
+                    label_smoothing=self.label_smoothing,
                 )
 
             self.scaler.scale(loss).backward()
@@ -246,10 +324,14 @@ class Stage1Trainer:
             batch_r = batch_r.to(self.device)
 
             with autocast('cuda', enabled=self.use_amp):
-                logits, _ = self.model(batch_x)
+                logits, latent = self.model(batch_x)
                 loss, _ = compute_combined_loss(
                     logits, batch_y, batch_r,
                     class_weights, alpha, self.aux_loss_fn,
+                    contrastive_loss_fn=self.contrastive_loss_fn,
+                    latent=latent,
+                    contrastive_weight=self.contrastive_weight,
+                    label_smoothing=self.label_smoothing,
                 )
 
             total_loss += loss.item()
