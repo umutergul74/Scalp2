@@ -87,7 +87,7 @@ def load_fold_artifacts(
     artifacts = {}
 
     artifacts["model_state"] = torch.load(
-        fold_dir / "hybrid_encoder.pt", map_location=device, weights_only=True
+        fold_dir / "hybrid_encoder.pt", map_location=device, weights_only=False
     )
 
     with open(fold_dir / "scaler.pkl", "rb") as f:
