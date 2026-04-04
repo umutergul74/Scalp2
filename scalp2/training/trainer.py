@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from scalp2.config import TrainingConfig
 from scalp2.data.dataset import ScalpDataset, create_dataloaders
+from scalp2.losses.center_loss import CenterLoss
 from scalp2.losses.contrastive_loss import SupConLoss
 from scalp2.losses.log_mdd_loss import LogMDDLoss, compute_combined_loss
 from scalp2.losses.sharpe_loss import SharpeLoss
@@ -140,19 +141,25 @@ class Stage1Trainer:
         )
         self.contrastive_weight = config.loss.contrastive_weight
         self.label_smoothing = config.loss.label_smoothing
+        self.focal_gamma = config.loss.focal_gamma
+        self.center_loss_weight = config.loss.center_loss_weight
+
+        # Center loss — initialized per fold in train_one_fold
+        self.center_loss_fn = None
 
         # Callbacks
         self.checkpoint = ModelCheckpoint(save_dir=checkpoint_dir)
 
         logger.info(
             "Stage1Trainer initialized: device=%s, AMP=%s, params=%d, "
-            "scheduler=%s, label_smoothing=%.2f, contrastive_weight=%.2f",
+            "scheduler=%s, focal_gamma=%.1f, contrastive=%.2f, center=%.2f",
             self.device,
             self.use_amp,
             model.count_parameters(),
             config.scheduler.type,
-            self.label_smoothing,
+            self.focal_gamma,
             self.contrastive_weight,
+            self.center_loss_weight,
         )
 
     def _compute_alpha(self, epoch: int) -> float:
@@ -216,6 +223,12 @@ class Stage1Trainer:
             patience=self.config.early_stopping.patience,
             min_delta=self.config.early_stopping.min_delta,
         )
+
+        # Initialize Center Loss per fold (fresh centroids)
+        self.center_loss_fn = CenterLoss(
+            num_classes=3,
+            latent_dim=self.model.latent_dim,
+        ).to(self.device)
 
         history = {"train_loss": [], "val_loss": [], "lr": []}
 
@@ -288,9 +301,12 @@ class Stage1Trainer:
                     logits, batch_y, batch_r,
                     class_weights, alpha, self.aux_loss_fn,
                     contrastive_loss_fn=self.contrastive_loss_fn,
+                    center_loss_fn=self.center_loss_fn,
                     latent=latent,
                     contrastive_weight=self.contrastive_weight,
+                    center_loss_weight=self.center_loss_weight,
                     label_smoothing=self.label_smoothing,
+                    focal_gamma=self.focal_gamma,
                 )
 
             self.scaler.scale(loss).backward()
@@ -329,9 +345,12 @@ class Stage1Trainer:
                     logits, batch_y, batch_r,
                     class_weights, alpha, self.aux_loss_fn,
                     contrastive_loss_fn=self.contrastive_loss_fn,
+                    center_loss_fn=self.center_loss_fn,
                     latent=latent,
                     contrastive_weight=self.contrastive_weight,
+                    center_loss_weight=self.center_loss_weight,
                     label_smoothing=self.label_smoothing,
+                    focal_gamma=self.focal_gamma,
                 )
 
             total_loss += loss.item()

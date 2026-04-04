@@ -132,8 +132,8 @@ class GRUConfig:
 
 @dataclass
 class FusionConfig:
-    latent_dim: int = 128
-    bottleneck_dim: int = 64
+    latent_dim: int = 64
+    bottleneck_dim: int = 32
     dropout: float = 0.4
 
 
@@ -202,7 +202,9 @@ class LossConfig:
     alpha_anneal_epochs: int = 20
     label_smoothing: float = 0.1
     contrastive_weight: float = 0.15
-    contrastive_temp: float = 0.07
+    contrastive_temp: float = 0.10
+    focal_gamma: float = 2.0
+    center_loss_weight: float = 0.05
 
 
 @dataclass

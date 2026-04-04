@@ -77,8 +77,8 @@ model:
     attention_pooling: true
 
   fusion:
-    latent_dim: 128
-    bottleneck_dim: 64
+    latent_dim: 64
+    bottleneck_dim: 32
     dropout: 0.4
 
   xgboost:
@@ -133,7 +133,9 @@ training:
     alpha_anneal_epochs: 20
     label_smoothing: 0.1
     contrastive_weight: 0.15
-    contrastive_temp: 0.07
+    contrastive_temp: 0.10
+    focal_gamma: 2.0
+    center_loss_weight: 0.05
 
   class_weights: "inverse_frequency"
 

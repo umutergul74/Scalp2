@@ -1,4 +1,4 @@
-"""Logarithmic Maximum Drawdown loss + combined loss with contrastive term."""
+"""Logarithmic Maximum Drawdown loss + combined loss with Focal, SupCon, Center terms."""
 
 from __future__ import annotations
 
@@ -6,18 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from scalp2.losses.focal_loss import FocalLoss
+
 
 class LogMDDLoss(nn.Module):
     """Logarithmic Maximum Drawdown loss.
 
     Computes the cumulative PnL curve from predicted positions,
     finds the maximum drawdown, and returns log(1 + MDD).
-
-    Combined loss strategy:
-        total_loss = alpha * CE_loss + beta * SupCon_loss + (1 - alpha - beta) * Aux_loss
-
-    Alpha is annealed from 1.0 → 0.5 over training to start with stable
-    CE gradients and gradually introduce the finance-aware objective.
     """
 
     def __init__(self, eps: float = 1e-8):
@@ -36,25 +32,13 @@ class LogMDDLoss(nn.Module):
         Returns:
             Scalar loss: log(1 + max_drawdown)
         """
-        # Soft position
         probs = F.softmax(logits, dim=1)
         position = probs[:, 2] - probs[:, 0]
-
-        # Portfolio returns
         portfolio_returns = position * forward_returns
-
-        # Cumulative PnL curve
         cum_returns = torch.cumsum(portfolio_returns, dim=0)
-
-        # Running maximum
         running_max = torch.cummax(cum_returns, dim=0)[0]
-
-        # Drawdown at each point
         drawdown = running_max - cum_returns
-
-        # Maximum drawdown
         max_drawdown = drawdown.max()
-
         return torch.log1p(max_drawdown + self.eps)
 
 
@@ -66,35 +50,49 @@ def compute_combined_loss(
     alpha: float,
     auxiliary_loss_fn: nn.Module,
     contrastive_loss_fn: nn.Module | None = None,
+    center_loss_fn: nn.Module | None = None,
     latent: torch.Tensor | None = None,
     contrastive_weight: float = 0.0,
+    center_loss_weight: float = 0.0,
     label_smoothing: float = 0.0,
+    focal_gamma: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Compute combined CE + contrastive + auxiliary finance loss.
+    """Compute combined Focal/CE + SupCon + Center + auxiliary finance loss.
 
-    Loss formula:
-        total = alpha * CE(label_smoothing) + beta * SupCon + (1-alpha-beta) * Aux
+    v4 Loss formula:
+        total = α × Focal(label_smoothing)     # Classification (hard example focus)
+              + β × SupCon(temp=0.10)           # Push classes apart
+              + γ × CenterLoss                  # Pull each class to its centroid
+              + (1-α-β-γ) × SharpeLoss          # Financial awareness
 
     Args:
         logits: (batch, 3)
         labels: (batch,) — class indices {0, 1, 2}
         forward_returns: (batch,) — actual forward returns
-        class_weights: Optional class weights for CE loss
-        alpha: CE weighting factor (1.0 = pure CE, 0.0 = pure auxiliary)
+        class_weights: Optional class weights
+        alpha: Classification loss weight (annealed 1.0 → 0.5)
         auxiliary_loss_fn: SharpeLoss or LogMDDLoss instance
         contrastive_loss_fn: Optional SupConLoss instance
-        latent: Optional (batch, latent_dim) for contrastive loss
-        contrastive_weight: Beta — weight for contrastive loss
-        label_smoothing: Label smoothing factor (0.0 = hard labels)
+        center_loss_fn: Optional CenterLoss instance
+        latent: Optional (batch, latent_dim) for contrastive/center loss
+        contrastive_weight: β — SupCon weight
+        center_loss_weight: γ — Center Loss weight
+        label_smoothing: Label smoothing factor
+        focal_gamma: Focal Loss gamma (0.0 = standard CE)
 
     Returns:
         total_loss: Scalar combined loss
         loss_components: Dict with individual loss values for logging
     """
-    # CE loss with label smoothing
-    ce_loss = F.cross_entropy(
-        logits, labels, weight=class_weights, label_smoothing=label_smoothing
-    )
+    # Classification loss: Focal Loss (if gamma > 0) or CE
+    if focal_gamma > 0:
+        focal_fn = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
+        cls_loss = focal_fn(logits, labels, weight=class_weights)
+    else:
+        cls_loss = F.cross_entropy(
+            logits, labels, weight=class_weights,
+            label_smoothing=label_smoothing,
+        )
 
     # Auxiliary finance loss (Sharpe or LogMDD)
     aux_loss = auxiliary_loss_fn(logits, forward_returns)
@@ -104,18 +102,32 @@ def compute_combined_loss(
     if contrastive_loss_fn is not None and latent is not None and contrastive_weight > 0:
         con_loss = contrastive_loss_fn(latent, labels)
 
-    # Combined: alpha * CE + beta * SupCon + (1 - alpha - beta) * Aux
+    # Center loss on latent space
+    cen_loss = torch.tensor(0.0, device=logits.device)
+    if center_loss_fn is not None and latent is not None and center_loss_weight > 0:
+        cen_loss = center_loss_fn(latent, labels)
+
+    # Combined: α*Focal + β*SupCon + γ*Center + (1-α-β-γ)*Aux
     beta = contrastive_weight
-    aux_weight = max(0.0, 1.0 - alpha - beta)
-    total = alpha * ce_loss + beta * con_loss + aux_weight * aux_loss
+    gamma = center_loss_weight
+    aux_weight = max(0.0, 1.0 - alpha - beta - gamma)
+
+    total = (
+        alpha * cls_loss
+        + beta * con_loss
+        + gamma * cen_loss
+        + aux_weight * aux_loss
+    )
 
     components = {
-        "ce_loss": ce_loss.item(),
+        "cls_loss": cls_loss.item(),
         "aux_loss": aux_loss.item(),
         "con_loss": con_loss.item(),
+        "cen_loss": cen_loss.item(),
         "total_loss": total.item(),
         "alpha": alpha,
         "beta": beta,
+        "gamma": gamma,
     }
 
     return total, components
