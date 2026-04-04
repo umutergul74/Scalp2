@@ -134,7 +134,7 @@ training:
     label_smoothing: 0.1
     contrastive_weight: 0.15
     contrastive_temp: 0.10
-    focal_gamma: 2.0
+    focal_gamma: 1.0
     center_loss_weight: 0.05
 
   class_weights: "inverse_frequency"
