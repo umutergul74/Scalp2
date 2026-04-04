@@ -155,6 +155,7 @@ notebook = {
                 "        plt.xlabel('Tahmin Edilen Long Olas\u0131l\u0131\u011f\u0131', fontsize=12)\n",
                 "        plt.ylabel('Ger\u00e7ekle\u015fen Ba\u015far\u0131 (Long Hedefe Ula\u015fma)', fontsize=12)\n",
                 "        plt.legend()\n",
+                "        plt.savefig('diag_calibration.png', bbox_inches='tight')\n",
                 "        plt.show()\n",
                 "        \n",
                 "        net_prob = probs[:, 2] - probs[:, 0]\n",
@@ -164,6 +165,22 @@ notebook = {
                 "            print('\\u2705 Model, k\u00e2rl\u0131 fiyat hareketi b\u00fcy\u00fckl\u00fc\u011f\u00fcn\u00fc de a\u011f\u0131rl\u0131kland\u0131rarak b\u00fcy\u00fck olas\u0131l\u0131k verebiliyor (Pozitif Korelasyon).\\n')\n",
                 "        else:\n",
                 "            print('\\u26a0\\ufe0f Zay\u0131f IC. Model yanl\u0131\u015f hedeflerde b\u00fcy\u00fck stop loss yiyor olabilir.\\n')\n",
+                "            \n",
+                "        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score\n",
+                "        y_pred = np.argmax(probs, axis=1)\n",
+                "        print(f'\\n\\u25b6 MULTICLASS METRICS:')\n",
+                "        print(f'Accuracy: {accuracy_score(labels, y_pred):.4f}')\n",
+                "        print(f'Precision (Long): {precision_score(labels, y_pred, labels=[2], average=\"macro\", zero_division=0):.4f}')\n",
+                "        print(f'Recall (Long): {recall_score(labels, y_pred, labels=[2], average=\"macro\", zero_division=0):.4f}')\n",
+                "        print(f'F1 Score (Long): {f1_score(labels, y_pred, labels=[2], average=\"macro\", zero_division=0):.4f}\\n')\n",
+                "        \n",
+                "        with open('diag_metrics.txt', 'w') as mf:\n",
+                "            mf.write(f'Brier Score: {b_score:.4f}\\n')\n",
+                "            mf.write(f'Rank IC: {rank_ic:.4f} (p={p_val:.4f})\\n')\n",
+                "            mf.write(f'Accuracy: {accuracy_score(labels, y_pred):.4f}\\n')\n",
+                "            mf.write(f'Precision (Long): {precision_score(labels, y_pred, labels=[2], average=\"macro\", zero_division=0):.4f}\\n')\n",
+                "            mf.write(f'Recall (Long): {recall_score(labels, y_pred, labels=[2], average=\"macro\", zero_division=0):.4f}\\n')\n",
+                "            mf.write(f'F1 Score (Long): {f1_score(labels, y_pred, labels=[2], average=\"macro\", zero_division=0):.4f}\\n')\n",
                 "            \n",
                 "    else:\n",
                 "        print(\"\\u26a0\\ufe0f Fold 053 i\u00e7in OOS prediction verisiwf_predictions.pkl i\u00e7inde bulunamad\u0131.\")\n",
@@ -252,7 +269,10 @@ notebook = {
                 "ax2.set_ylabel('t-SNE 2')\n",
                 "\n",
                 "plt.suptitle('Deep Learning (TCN+GRU) \u00d6znitelik Ayr\u0131\u015ft\u0131rma Performans\u0131', fontsize=15)\n",
+                "plt.savefig('diag_latent.png', bbox_inches='tight')\n",
                 "plt.show()\n",
+                "with open('diag_metrics.txt', 'a') as mf:\n",
+                "    mf.write(f'PCA Explained Var: {np.sum(pca.explained_variance_ratio_):.4f}\\n')\n",
                 "print('\\n\\u2728 YORUM: Noktalar renklerine g\u00f6re adalara b\u00f6l\u00fcn\u00fc\u00fcyorsa model ayr\u0131\u015ft\u0131rma i\u015fini \u00e7\u00f6zm\u00fc\u015ft\u00fcr. Tam bir g\u00fcr\u00fclt\u00fc e\u011frisi (yuvarlak duman) ise DL k\u0131sm\u0131 zay\u0131f kalm\u0131\u015ft\u0131r.')"
             ]
         },
@@ -290,7 +310,40 @@ notebook = {
                 "plt.title(f'SHAP Summary (Long Yönü) - Fold {TARGET_FOLD}', fontsize=16)\n",
                 "shap.summary_plot(shap_long, X_sample_xgb, feature_names=feature_names_xgb, show=False)\n",
                 "plt.tight_layout()\n",
-                "plt.show()"
+                "plt.savefig('diag_shap.png', bbox_inches='tight')\n",
+                "plt.show()\n",
+                "with open('diag_metrics.txt', 'a') as mf:\n",
+                "    mf.write(f'SHAP Top 3 (Long): {feature_names_xgb[np.abs(shap_long).mean(0).argsort()[::-1][0]]}, {feature_names_xgb[np.abs(shap_long).mean(0).argsort()[::-1][1]]}, {feature_names_xgb[np.abs(shap_long).mean(0).argsort()[::-1][2]]}\\n')\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 5. Çıktıları Paketle (İndirmek İçin)\n",
+                "Yukarıda oluşturulan tüm metrikleri ve PNG grafiklerini tek bir ZIP dosyasında toplar."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import shutil\n",
+                "import os\n",
+                "\n",
+                "print('Çıktılar paketleniyor...')\n",
+                "os.makedirs('diag_export', exist_ok=True)\n",
+                "files_to_copy = ['diag_metrics.txt', 'diag_calibration.png', 'diag_latent.png', 'diag_shap.png']\n",
+                "\n",
+                "for f in files_to_copy:\n",
+                "    if os.path.exists(f):\n",
+                "        shutil.copy(f, f'diag_export/{f}')\n",
+                "        print(f'{f} eklendi.')\n",
+                "\n",
+                "shutil.make_archive('diagnostic_results', 'zip', 'diag_export')\n",
+                "print('\\n✅ BİTTİ! Colab sol menüsünden diagnostic_results.zip dosyasını indirebilirsiniz.')"
             ]
         }
     ],

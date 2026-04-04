@@ -77,25 +77,6 @@ class HybridEncoder(nn.Module):
         self.classifier = nn.Linear(latent_dim, 3)
         self.latent_dim = latent_dim
 
-        # Contrastive projection head (SupCon paper: separate MLP for contrastive loss)
-        # This decouples cluster formation from classification — critical for clean t-SNE
-        self.contrastive_head = nn.Sequential(
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.ReLU(),
-            nn.Linear(latent_dim // 2, 32),
-        )
-
-    def contrastive_project(self, latent: torch.Tensor) -> torch.Tensor:
-        """Project latent vectors into contrastive space with L2 normalization.
-
-        Args:
-            latent: (batch, latent_dim)
-        Returns:
-            (batch, 32) — L2-normalized projection for SupCon loss
-        """
-        projected = self.contrastive_head(latent)
-        return F.normalize(projected, dim=1)
-
     def forward(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -1,0 +1,8 @@
+Brier Score: 0.1957
+Rank IC: 0.2192 (p=0.0000)
+Accuracy: 0.4485
+Precision (Long): 0.3900
+Recall (Long): 0.3944
+F1 Score (Long): 0.3922
+PCA Explained Var: 0.7391
+SHAP Top 3 (Long): latent_106, 1h_ema_21_slope, latent_103
