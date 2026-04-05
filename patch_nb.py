@@ -25,7 +25,7 @@ nb["cells"][2]["source"] = _lines(
     REPO_DIR = '/content/scalp2_repo'
     REPO_REF = os.environ.get(
         'SCALP2_GIT_REF',
-        'codex/backtest-paper-safety-20260405',
+        'main',
     )
 
     if not os.path.exists(os.path.join(REPO_DIR, '.git')):
