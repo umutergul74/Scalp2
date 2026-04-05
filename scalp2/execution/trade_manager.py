@@ -260,14 +260,14 @@ class TradeManager:
                         trade.current_stop_loss = tight_sl
             else:
                 trade.status = TradeStatus.CLOSED_REGIME
-                trade.pnl = unrealized * trade.remaining_size
+                trade.pnl += unrealized * trade.remaining_size
                 logger.info("Trade closed: regime change to choppy (PnL=%.4f)", trade.pnl)
                 return trade
 
         # Check time barrier
         if trade.bars_held >= self.max_holding_bars:
             trade.status = TradeStatus.CLOSED_TIME
-            trade.pnl = unrealized * trade.remaining_size
+            trade.pnl += unrealized * trade.remaining_size
             logger.info("Trade closed: time barrier (PnL=%.4f)", trade.pnl)
             return trade
 

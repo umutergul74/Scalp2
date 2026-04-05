@@ -53,6 +53,18 @@ from scalp2.utils.serialization import load_fold_artifacts
 from scalp2.live.data_pipeline import DataPipeline
 from scalp2.live.exchange import BinanceExecutor
 from scalp2.live.notifier import TelegramNotifier
+from scalp2.live.paper import (
+    active_trade_to_trade_state,
+    backfill_legacy_partial_tp_state,
+    directional_return_frac,
+    effective_paper_balance,
+    equity_impact_pct,
+    marked_to_market_pnl_frac,
+    normalize_close_reason,
+    pnl_usd_from_return_frac,
+    protection_status_for_close,
+    sync_active_trade_from_trade_state,
+)
 from scalp2.live.state import BotState, ActiveTrade
 
 logger = logging.getLogger(__name__)
@@ -137,6 +149,9 @@ class LiveBot:
         # State (restore from disk)
         self.state = BotState.load(self.state_dir)
         self.state.paper_mode = self.paper_mode
+        if self.paper_mode and self.state.active_trade is not None:
+            if self._backfill_legacy_paper_trade_state(self.state.active_trade):
+                self.state.save(self.state_dir)
 
         # Restore online HMM stats if enabled
         if self.config.regime.online_update_enabled and self.regime_detector is not None:
@@ -464,13 +479,47 @@ class LiveBot:
         except Exception as e:
             logger.warning("Failed to load risk state: %s — starting fresh", e)
 
+    def _paper_balance(self, fallback_balance: float = 1000.0) -> float:
+        """Return current paper equity using persisted balance and PnL."""
+        return effective_paper_balance(
+            self.state.start_balance,
+            self.state.total_pnl_usd,
+            fallback_balance=fallback_balance,
+        )
+
+    def _backfill_legacy_paper_trade_state(self, trade: ActiveTrade) -> bool:
+        """Repair paper-trade accounting when restoring older state snapshots."""
+        partial_tp_atr = (
+            trade.adaptive_partial_tp_atr
+            or self.config.execution.trade_management.partial_tp_1_atr
+        )
+        partial_tp_pct = self.config.execution.trade_management.partial_tp_1_pct
+        repaired = backfill_legacy_partial_tp_state(
+            trade,
+            partial_tp_atr=partial_tp_atr,
+            partial_tp_pct=partial_tp_pct,
+        )
+        if repaired:
+            logger.warning(
+                "Backfilled legacy paper trade TP1 state after restart "
+                "(remaining=%.2f, realized=%.6f)",
+                trade.remaining_size_frac,
+                trade.realized_pnl_frac,
+            )
+        return repaired
+
     async def _execute_signal(self, signal, current_atr: float) -> None:
         """Place orders on exchange for a trade signal."""
         direction = signal.direction.value
         leverage = self.config.execution.position_sizing.leverage
 
         # Calculate position size in USD
-        balance = await self.executor.get_balance()
+        if self.paper_mode:
+            if self.state.start_balance <= 0:
+                self.state.start_balance = await self.executor.get_balance()
+            balance = self._paper_balance(fallback_balance=self.state.start_balance)
+        else:
+            balance = await self.executor.get_balance()
         size_usd = balance * signal.position_size * leverage
 
         if size_usd < 10:  # Binance min notional
@@ -559,6 +608,7 @@ class LiveBot:
             order_id=result["order_id"],
             sl_order_id=result["sl_order_id"],
             tp_order_id=result["tp_order_id"],
+            entry_equity=balance,
             adaptive_partial_tp_atr=adaptive.get("adaptive_partial_tp_atr"),
             adaptive_full_tp_atr=adaptive.get("adaptive_full_tp_atr"),
             adaptive_trailing_act_atr=adaptive.get("adaptive_trailing_act_atr"),
@@ -584,6 +634,10 @@ class LiveBot:
         """Check and manage an open trade — partial TP, breakeven, time stop."""
         trade = self.state.active_trade
         if trade is None:
+            return
+
+        if self.paper_mode:
+            await self._manage_paper_trade(trade)
             return
 
         trade.bars_held += 1
@@ -715,31 +769,144 @@ class LiveBot:
             atr_move=atr_move,
         )
 
+    async def _manage_paper_trade(self, trade: ActiveTrade) -> None:
+        """Manage paper trades with the same TradeManager logic as backtests."""
+        fallback_balance = self.state.start_balance
+        if fallback_balance <= 0:
+            fallback_balance = await self.executor.get_balance()
+            self.state.start_balance = fallback_balance
+
+        if trade.entry_equity <= 0:
+            trade.entry_equity = self._paper_balance(fallback_balance=fallback_balance)
+
+        data = await self.pipeline.prepare()
+        structural_levels = None
+        is_choppy = False
+
+        if data is not None:
+            last_row = data["df_full"].iloc[-1]
+            price = float(last_row["close"])
+            candle_high = float(last_row["high"])
+            candle_low = float(last_row["low"])
+            structural_levels = data.get("structural_levels")
+
+            if self.regime_detector is not None and data.get("regime_df") is not None:
+                try:
+                    regime_probs = self.regime_detector.predict_proba_online(
+                        data["regime_df"]
+                    )
+                    choppy_prob = float(regime_probs[-1, 2])
+                    is_choppy = (
+                        choppy_prob > self.config.regime.choppy_threshold
+                        and data.get("current_adx", 999.0)
+                        < self.config.execution.choppy_adx_override
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Paper regime inference failed during trade management: %s", e
+                    )
+        else:
+            logger.warning(
+                "Data pipeline unavailable during paper trade management, "
+                "falling back to last candle only"
+            )
+            try:
+                last_candle = await self.executor.fetch_last_candle()
+            except Exception as e:
+                logger.warning("Failed to get paper candle fallback: %s", e)
+                return
+            price = float(last_candle["close"])
+            candle_high = float(last_candle["high"])
+            candle_low = float(last_candle["low"])
+
+        runtime_trade = active_trade_to_trade_state(trade)
+        had_partial_tp = trade.partial_tp_done
+        updated_trade = self.trade_manager.update(
+            runtime_trade,
+            current_high=candle_high,
+            current_low=candle_low,
+            current_close=price,
+            is_choppy=is_choppy,
+            structural_levels=structural_levels,
+        )
+        sync_active_trade_from_trade_state(trade, updated_trade)
+
+        if trade.partial_tp_done and not had_partial_tp:
+            self.state.save(self.state_dir)
+            await self.notifier.info(
+                f"TP1 hit - 50% realize edildi, SL -> breakeven "
+                f"(${trade.entry_price:,.1f})"
+            )
+
+        if updated_trade.status not in (TradeStatus.OPEN, TradeStatus.PARTIAL_TP):
+            reason_map = {
+                TradeStatus.CLOSED_TP: "TP",
+                TradeStatus.CLOSED_SL: "SL",
+                TradeStatus.CLOSED_TIME: "TIME",
+                TradeStatus.CLOSED_REGIME: "REGIME",
+            }
+            exit_price = price
+            if updated_trade.status == TradeStatus.CLOSED_TP:
+                exit_price = trade.take_profit
+            elif updated_trade.status == TradeStatus.CLOSED_SL:
+                exit_price = trade.stop_loss
+            close_reason = normalize_close_reason(
+                reason_map.get(updated_trade.status, "REGIME"),
+                updated_trade.pnl,
+            )
+
+            await self._finalize_trade(
+                exit_price=exit_price,
+                reason=close_reason,
+                pnl_pct=updated_trade.pnl,
+            )
+            return
+
+        total_pnl_frac = marked_to_market_pnl_frac(trade, price)
+        total_pnl_usd = pnl_usd_from_return_frac(
+            total_pnl_frac, trade.position_size_usd
+        )
+        total_pnl_pct = equity_impact_pct(total_pnl_usd, trade.entry_equity)
+        atr_move = (
+            directional_return_frac(trade.entry_price, price, trade.direction)
+            * trade.entry_price
+            / (trade.atr_at_entry + 1e-10)
+        )
+
+        self.state.save(self.state_dir)
+        await self.notifier.trade_status(
+            trade=trade,
+            current_price=price,
+            unrealized_pct=total_pnl_pct / 100.0,
+            atr_move=atr_move,
+            total_pnl_usd=total_pnl_usd,
+            total_pnl_pct=total_pnl_pct,
+            remaining_size_frac=trade.remaining_size_frac,
+        )
+
     async def _finalize_trade(self, exit_price: float, reason: str, pnl_pct: float | None = None) -> None:
         """Record trade completion and clear state."""
         trade = self.state.active_trade
         if trade is None:
             return
 
-        leverage = self.config.execution.position_sizing.leverage
-
         if pnl_pct is None:
-            if trade.direction == "LONG":
-                pnl_pct = (exit_price - trade.entry_price) / trade.entry_price
-            else:
-                pnl_pct = (trade.entry_price - exit_price) / trade.entry_price
+            pnl_pct = marked_to_market_pnl_frac(trade, exit_price)
 
-        pnl_usd = pnl_pct * trade.position_size_usd * leverage
-        leveraged_pnl_pct = pnl_pct * leverage * 100  # % of equity
+        pnl_usd = pnl_usd_from_return_frac(pnl_pct, trade.position_size_usd)
+        entry_equity = trade.entry_equity
+        if entry_equity <= 0:
+            leverage = max(self.config.execution.position_sizing.leverage, 1)
+            denom = trade.position_size_frac * leverage
+            if denom > 0:
+                entry_equity = trade.position_size_usd / denom
+            else:
+                entry_equity = self._paper_balance()
+        leveraged_pnl_pct = equity_impact_pct(pnl_usd, entry_equity)
         self.state.record_trade(pnl_usd)
 
         # Record in trade manager for SL protection (Enhancement 1)
-        trade_status = {
-            "SL": TradeStatus.CLOSED_SL,
-            "TP": TradeStatus.CLOSED_TP,
-            "TIME": TradeStatus.CLOSED_TIME,
-            "exchange_close": TradeStatus.CLOSED_SL,  # Assume SL if exchange closed
-        }.get(reason, TradeStatus.CLOSED_REGIME)
+        trade_status = protection_status_for_close(reason, pnl_pct)
         self.trade_manager.record_trade_result(
             status=trade_status,
             exit_price=exit_price,
@@ -757,8 +924,15 @@ class LiveBot:
         self._save_risk_state()
 
         logger.info(
-            "Trade closed: %s %s | entry=$%.1f exit=$%.1f | PnL=$%.2f (%.2f%%)",
-            trade.direction, reason, trade.entry_price, exit_price, pnl_usd, pnl_pct * 100,
+            "Trade closed: %s %s | entry=$%.1f exit=$%.1f | "
+            "PnL=$%.2f (return=%.2f%%, equity=%.2f%%)",
+            trade.direction,
+            reason,
+            trade.entry_price,
+            exit_price,
+            pnl_usd,
+            pnl_pct * 100,
+            leveraged_pnl_pct,
         )
 
         await self.notifier.trade_closed(
@@ -766,7 +940,7 @@ class LiveBot:
             entry=trade.entry_price,
             exit_price=exit_price,
             pnl_usd=pnl_usd,
-            pnl_pct=pnl_pct * 100,
+            pnl_pct=leveraged_pnl_pct,
             reason=reason,
             bars_held=trade.bars_held,
         )
@@ -871,22 +1045,33 @@ class LiveBot:
         self._save_risk_state()
 
         if self.state.active_trade is not None:
-            logger.info(
-                "Active trade left open with SL/TP on exchange — safe to restart"
-            )
-            await self.notifier.info(
-                "Bot durduruluyor — açık pozisyon var, SL/TP emirleri borsada duruyor!"
-            )
+            if self.paper_mode:
+                logger.info("Active paper trade preserved in state — safe to restart")
+                await self.notifier.info(
+                    "Bot durduruluyor — acik paper pozisyon state'e kaydedildi, restart sonrasi devam edecek."
+                )
+            else:
+                logger.info(
+                    "Active trade left open with SL/TP on exchange — safe to restart"
+                )
+                await self.notifier.info(
+                    "Bot durduruluyor — acik pozisyon var, SL/TP emirleri borsada duruyor!"
+                )
         else:
-            await self.notifier.info("Bot durduruluyor — açık pozisyon yok.")
+            await self.notifier.info("Bot durduruluyor — acik pozisyon yok.")
 
         # Daily summary
         ds = self.state.daily_stats
         if ds.trades > 0:
-            balance = await self.executor.get_balance()
+            if self.paper_mode:
+                balance = self._paper_balance(
+                    fallback_balance=self.state.start_balance or 1000.0
+                )
+            else:
+                balance = await self.executor.get_balance()
             await self.notifier.daily_summary(
                 date=ds.date, trades=ds.trades,
-                wins=ds.wins, losses=ds.losses,
+                wins=ds.wins, losses=ds.losses, breakevens=ds.breakevens,
                 pnl_usd=ds.pnl_usd, balance=balance,
             )
 

@@ -113,13 +113,18 @@ class TelegramNotifier:
         trades: int,
         wins: int,
         losses: int,
+        breakevens: int,
         pnl_usd: float,
         balance: float,
     ) -> None:
         wr = wins / max(trades, 1) * 100
+        wl_line = f"İşlem : {trades} (W:{wins} L:{losses}"
+        if breakevens > 0:
+            wl_line += f" BE:{breakevens}"
+        wl_line += ")"
         msg = (
             f"📊 <b>Günlük Rapor — {date}</b>\n"
-            f"İşlem : {trades} (W:{wins} L:{losses})\n"
+            f"{wl_line}\n"
             f"WR    : <code>{wr:.0f}%</code>\n"
             f"PnL   : <code>{'+' if pnl_usd >= 0 else ''}{pnl_usd:,.2f}$</code>\n"
             f"Bakiye: <code>${balance:,.2f}</code>"
@@ -192,10 +197,23 @@ class TelegramNotifier:
         current_price: float,
         unrealized_pct: float,
         atr_move: float,
+        total_pnl_usd: float | None = None,
+        total_pnl_pct: float | None = None,
+        remaining_size_frac: float | None = None,
     ) -> None:
         """Send periodic trade status update during active trade."""
         direction_emoji = "🟢" if trade.direction == "LONG" else "🔴"
-        pnl_emoji = "📈" if unrealized_pct > 0 else "📉"
+        display_pct = total_pnl_pct if total_pnl_pct is not None else unrealized_pct * 100
+        pnl_emoji = "📈" if display_pct > 0 else "📉"
+        pnl_line = f"PnL    : {pnl_emoji} <code>{display_pct:+.2f}%</code> ({atr_move:.2f} ATR)\n"
+        if total_pnl_usd is not None:
+            pnl_line = (
+                f"PnL    : {pnl_emoji} <code>{total_pnl_usd:+,.2f}$ "
+                f"({display_pct:+.2f}%)</code> ({atr_move:.2f} ATR)\n"
+            )
+        size_line = ""
+        if remaining_size_frac is not None and remaining_size_frac < 0.999:
+            size_line = f"Kalan  : <code>{remaining_size_frac*100:.0f}%</code>\n"
 
         msg = (
             f"{direction_emoji} <b>Trade Durumu — Bar {trade.bars_held}</b>\n"
@@ -203,7 +221,8 @@ class TelegramNotifier:
             f"Giriş  : <code>${trade.entry_price:,.1f}</code>\n"
             f"Şimdi  : <code>${current_price:,.1f}</code>\n"
             f"SL     : <code>${trade.stop_loss:,.1f}</code>\n"
-            f"PnL    : {pnl_emoji} <code>{unrealized_pct*100:+.2f}%</code> ({atr_move:.2f} ATR)\n"
+            f"{size_line}"
+            f"{pnl_line}"
             f"TP1    : {'✅' if trade.partial_tp_done else '⏳'}"
         )
         await self._send(msg)

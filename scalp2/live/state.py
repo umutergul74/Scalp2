@@ -23,8 +23,8 @@ class ActiveTrade:
     stop_loss: float
     take_profit: float
     atr_at_entry: float
-    position_size_usd: float
-    position_size_frac: float        # fraction of equity
+    position_size_usd: float         # original notional size in USD
+    position_size_frac: float        # fraction of equity committed as margin
     confidence: float
     entry_time: str                  # ISO format
     order_id: str = ""               # exchange order ID
@@ -32,6 +32,9 @@ class ActiveTrade:
     tp_order_id: str = ""
     partial_tp_done: bool = False    # True if TP1 (50%) already hit
     bars_held: int = 0
+    entry_equity: float = 0.0        # account equity when the trade was opened
+    remaining_size_frac: float = 1.0
+    realized_pnl_frac: float = 0.0   # weighted return vs original notional
     # Adaptive TP/SL overrides (None = use config defaults)
     adaptive_partial_tp_atr: float | None = None
     adaptive_full_tp_atr: float | None = None
@@ -45,6 +48,7 @@ class DailyStats:
     trades: int = 0
     wins: int = 0
     losses: int = 0
+    breakevens: int = 0
     pnl_usd: float = 0.0
 
 
@@ -93,15 +97,22 @@ class BotState:
         if self.daily_stats.date != today:
             self.daily_stats = DailyStats(date=today)
 
+    def current_balance(self, fallback_start_balance: float = 0.0) -> float:
+        """Return the current paper balance from persisted state."""
+        base = self.start_balance if self.start_balance > 0 else fallback_start_balance
+        return max(base + self.total_pnl_usd, 0.0)
+
     def record_trade(self, pnl_usd: float) -> None:
         """Record a completed trade."""
         self.total_trades += 1
         self.total_pnl_usd += pnl_usd
         self.daily_stats.trades += 1
-        if pnl_usd >= 0:
+        if pnl_usd > 0:
             self.daily_stats.wins += 1
-        else:
+        elif pnl_usd < 0:
             self.daily_stats.losses += 1
+        else:
+            self.daily_stats.breakevens += 1
         self.daily_stats.pnl_usd += pnl_usd
 
     # ── serialization helpers ─────────────────────────────────────────────
