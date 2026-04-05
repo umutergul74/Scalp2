@@ -963,5 +963,306 @@ nb["cells"][13]["source"] = _lines(
     """
 )
 
+export_cell = {
+    "cell_type": "code",
+    "execution_count": None,
+    "metadata": {},
+    "outputs": [],
+    "source": _lines(
+        """
+        # ============================================================
+        # Export Metrics Snapshot for Offline Review
+        # ============================================================
+        from pathlib import Path
+        import json
+        import subprocess
+        from datetime import datetime, timezone
+
+        def _json_safe(value):
+            if isinstance(value, dict):
+                return {str(k): _json_safe(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_json_safe(v) for v in value]
+            if isinstance(value, pd.DataFrame):
+                return [_json_safe(row) for row in value.to_dict(orient='records')]
+            if isinstance(value, pd.Series):
+                return _json_safe(value.to_dict())
+            if isinstance(value, pd.Timestamp):
+                return value.isoformat()
+            if isinstance(value, pd.Period):
+                return str(value)
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, np.integer):
+                return int(value)
+            if isinstance(value, np.floating):
+                return float(value)
+            if isinstance(value, np.bool_):
+                return bool(value)
+            return value
+
+        def _safe_git_short_head(repo_dir: str) -> str:
+            try:
+                return subprocess.check_output(
+                    ['git', '-C', repo_dir, 'rev-parse', '--short', 'HEAD'],
+                    text=True,
+                ).strip()
+            except Exception:
+                return 'unknown'
+
+        def _fmt_path_mtime(path_str: str) -> str | None:
+            try:
+                path = Path(path_str)
+                if not path.exists():
+                    return None
+                return pd.Timestamp(path.stat().st_mtime, unit='s').isoformat()
+            except Exception:
+                return None
+
+        def _summary_from_trades(df_trades: pd.DataFrame, initial_balance: float) -> dict:
+            if len(df_trades) == 0:
+                return {
+                    'total_trades': 0,
+                    'win_rate': 0.0,
+                    'profit_factor': 0.0,
+                    'expectancy_pct': 0.0,
+                    'net_pnl_pct': 0.0,
+                    'gross_pnl_pct': 0.0,
+                    'max_drawdown_pct': 0.0,
+                    'final_balance': float(initial_balance),
+                    'avg_bars_held': 0.0,
+                    'close_reasons': {},
+                }
+
+            df_local = df_trades.copy()
+            df_local['timestamp'] = pd.to_datetime(df_local['timestamp'])
+            daily_balance_local, daily_returns_local = _daily_balance_curve(df_local, initial_balance)
+
+            net = df_local['net_pnl'].astype(float).values
+            gross = df_local['gross_pnl'].astype(float).values if 'gross_pnl' in df_local.columns else np.array([], dtype=float)
+            wins = net[net > 0]
+            losses = net[net < 0]
+            profit_factor_local = abs(wins.sum() / losses.sum()) if len(losses) else (float('inf') if len(wins) else 0.0)
+            max_dd_local = max_drawdown_from_equity(
+                daily_balance_local.values,
+                initial_equity=float(initial_balance),
+            ) if len(daily_balance_local) else 0.0
+
+            return {
+                'total_trades': int(len(df_local)),
+                'win_rate': float(len(wins) / len(df_local)),
+                'profit_factor': float(profit_factor_local) if np.isfinite(profit_factor_local) else 'inf',
+                'expectancy_pct': float(net.mean() * 100.0),
+                'net_pnl_pct': float(((float(df_local['balance_after'].iloc[-1]) / float(initial_balance)) - 1.0) * 100.0),
+                'gross_pnl_pct': float(gross.sum() * 100.0) if len(gross) else 0.0,
+                'max_drawdown_pct': float(max_dd_local * 100.0),
+                'final_balance': float(df_local['balance_after'].iloc[-1]),
+                'avg_bars_held': float(df_local['bars_held'].mean()) if 'bars_held' in df_local.columns else 0.0,
+                'daily_sharpe': float(daily_returns_local.mean() / (daily_returns_local.std() + 1e-10) * np.sqrt(365)) if len(daily_returns_local) else 0.0,
+                'close_reasons': {str(k): int(v) for k, v in df_local['status'].value_counts().to_dict().items()},
+            }
+
+        def _yearly_records(df_trades: pd.DataFrame) -> list[dict]:
+            if len(df_trades) == 0:
+                return []
+            df_local = df_trades.copy()
+            df_local['timestamp'] = pd.to_datetime(df_local['timestamp'])
+            df_local['year'] = df_local['timestamp'].dt.year
+            rows = []
+            for year, grp in df_local.groupby('year'):
+                grp = grp.sort_values('timestamp')
+                grp_summary = _summary_from_trades(grp, float(grp['entry_equity'].iloc[0]))
+                rows.append({
+                    'year': int(year),
+                    'trades': grp_summary['total_trades'],
+                    'win_rate_pct': round(grp_summary['win_rate'] * 100.0, 4),
+                    'profit_factor': grp_summary['profit_factor'],
+                    'net_pnl_pct': round(grp_summary['net_pnl_pct'], 4),
+                    'max_drawdown_pct': round(grp_summary['max_drawdown_pct'], 4),
+                    'daily_sharpe': round(grp_summary['daily_sharpe'], 4),
+                })
+            return rows
+
+        def _quarterly_records(df_trades: pd.DataFrame) -> list[dict]:
+            if len(df_trades) == 0:
+                return []
+            df_local = df_trades.copy()
+            df_local['timestamp'] = pd.to_datetime(df_local['timestamp'])
+            df_local['quarter'] = df_local['timestamp'].dt.to_period('Q')
+            rows = []
+            for quarter, grp in df_local.groupby('quarter'):
+                net = grp['net_pnl'].astype(float).values
+                wins = net[net > 0]
+                losses = net[net < 0]
+                pf = abs(wins.sum() / losses.sum()) if len(losses) else (float('inf') if len(wins) else 0.0)
+                rows.append({
+                    'quarter': str(quarter),
+                    'trades': int(len(grp)),
+                    'win_rate_pct': round((len(wins) / len(grp)) * 100.0, 4) if len(grp) else 0.0,
+                    'profit_factor': float(pf) if np.isfinite(pf) else 'inf',
+                    'net_pnl_pct': round(float(net.sum() * 100.0), 4),
+                })
+            return rows
+
+        def _monthly_records(df_trades: pd.DataFrame, initial_balance: float) -> list[dict]:
+            if len(df_trades) == 0:
+                return []
+            df_local = df_trades.copy()
+            df_local['timestamp'] = pd.to_datetime(df_local['timestamp'])
+            daily_balance_local, _ = _daily_balance_curve(df_local, initial_balance)
+            monthly_balance = daily_balance_local.resample('M').last()
+            monthly_prev = monthly_balance.shift(1).fillna(initial_balance)
+            monthly_returns = (monthly_balance / monthly_prev - 1.0) * 100.0
+            monthly_trades = df_local.assign(month=df_local['timestamp'].dt.to_period('M')).groupby('month').size()
+            rows = []
+            for month, ret in monthly_returns.items():
+                period = month.to_period('M')
+                rows.append({
+                    'month': str(period),
+                    'return_pct': round(float(ret), 4),
+                    'trades': int(monthly_trades.get(period, 0)),
+                })
+            return rows
+
+        def _weekly_records(df_trades: pd.DataFrame) -> list[dict]:
+            if len(df_trades) == 0:
+                return []
+            df_local = df_trades.copy()
+            df_local['timestamp'] = pd.to_datetime(df_local['timestamp'])
+            df_local['week'] = df_local['timestamp'].dt.to_period('W')
+            weekly = df_local.groupby('week')['net_pnl'].agg(['sum', 'count']).reset_index()
+            return [
+                {
+                    'week': str(row['week']),
+                    'return_pct': round(float(row['sum'] * 100.0), 4),
+                    'trades': int(row['count']),
+                }
+                for _, row in weekly.iterrows()
+            ]
+
+        def _signal_summary(df_signals: pd.DataFrame) -> dict:
+            if 'sig_df' not in globals() or len(df_signals) == 0:
+                return {
+                    'total_signals': 0,
+                    'outcomes': {},
+                    'kelly_tradeable': 0,
+                    'kelly_rejected': 0,
+                }
+            zero_kelly = df_signals[df_signals['Pozisyon'].astype(str).str.startswith('0.00')]
+            tradeable_kelly = df_signals[~df_signals['Pozisyon'].astype(str).str.startswith('0.00')]
+            return {
+                'total_signals': int(len(df_signals)),
+                'outcomes': {str(k): int(v) for k, v in df_signals['Sonuc'].value_counts().to_dict().items()},
+                'kelly_tradeable': int(len(tradeable_kelly)),
+                'kelly_rejected': int(len(zero_kelly)),
+            }
+
+        report_dir = Path('/content/drive/MyDrive/scalp2/reports')
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        export_ts = pd.Timestamp.utcnow()
+        export_stamp = export_ts.strftime('%Y%m%d_%H%M%S')
+        git_head = _safe_git_short_head(REPO_DIR)
+
+        historical_summary = _summary_from_trades(trades_df, bt_initial_balance)
+        forward_summary = _summary_from_trades(fwd_df, fwd_initial_balance) if 'fwd_df' in globals() else _summary_from_trades(pd.DataFrame(), 1000.0)
+
+        report = {
+            'exported_at_utc': export_ts.isoformat(),
+            'repo_ref': REPO_REF,
+            'git_head': git_head,
+            'repo_dir': REPO_DIR,
+            'artifacts': {
+                'labeled_dataset_path': f'{DATA_DIR}/BTC_USDT_labeled.parquet',
+                'wf_predictions_path': f'{DATA_DIR}/wf_predictions.pkl',
+                'config_path': f'{REPO_DIR}/config.yaml',
+                'labeled_dataset_mtime': _fmt_path_mtime(f'{DATA_DIR}/BTC_USDT_labeled.parquet'),
+                'wf_predictions_mtime': _fmt_path_mtime(f'{DATA_DIR}/wf_predictions.pkl'),
+                'config_mtime': _fmt_path_mtime(f'{REPO_DIR}/config.yaml'),
+            },
+            'config_snapshot': {
+                'leverage': int(LEVERAGE),
+                'confidence_threshold': float(config.execution.confidence_threshold),
+                'forward_confidence_threshold': float(globals().get('FWD_CONFIDENCE_THRESHOLD', config.execution.confidence_threshold)),
+                'min_adx': float(config.execution.min_adx),
+                'min_atr_percentile': float(config.execution.min_atr_percentile),
+                'partial_tp_atr': float(config.execution.trade_management.partial_tp_1_atr),
+                'full_tp_atr': float(config.execution.trade_management.full_tp_atr),
+                'sl_atr': float(config.labeling.sl_multiplier),
+                'max_trades_per_day': int(config.execution.max_trades_per_day),
+            },
+            'historical': {
+                'summary': historical_summary,
+                'skip_reasons': {str(k): int(v) for k, v in skip_reasons.items()} if 'skip_reasons' in globals() else {},
+                'yearly': _yearly_records(trades_df),
+                'quarterly': _quarterly_records(trades_df),
+                'monthly': _monthly_records(trades_df, bt_initial_balance),
+            },
+            'forward': {
+                'cutoff': str(globals().get('FWD_TEST_CUTOFF', 'unknown')),
+                'fold_idx': int(globals().get('last_fold_idx', -1)),
+                'bars_after_cutoff': int(fwd_test_mask.sum()) if 'fwd_test_mask' in globals() else 0,
+                'summary': forward_summary,
+                'skip_reasons': {str(k): int(v) for k, v in fwd_skip.items()} if 'fwd_skip' in globals() else {},
+                'weekly': _weekly_records(fwd_df) if 'fwd_df' in globals() else [],
+            },
+            'signal_audit': _signal_summary(sig_df) if 'sig_df' in globals() else _signal_summary(pd.DataFrame()),
+        }
+
+        json_path = report_dir / f'06_backtest_metrics_{export_stamp}_{git_head}.json'
+        txt_path = report_dir / f'06_backtest_metrics_{export_stamp}_{git_head}.txt'
+
+        json_path.write_text(
+            json.dumps(_json_safe(report), indent=2, ensure_ascii=False),
+            encoding='utf-8',
+        )
+
+        lines = [
+            '06 BACKTEST METRICS SNAPSHOT',
+            f'exported_at_utc: {report["exported_at_utc"]}',
+            f'repo_ref: {report["repo_ref"]}',
+            f'git_head: {report["git_head"]}',
+            '',
+            'HISTORICAL SUMMARY',
+            json.dumps(_json_safe(report['historical']['summary']), indent=2, ensure_ascii=False),
+            '',
+            'HISTORICAL SKIP REASONS',
+            json.dumps(_json_safe(report['historical']['skip_reasons']), indent=2, ensure_ascii=False),
+            '',
+            'HISTORICAL YEARLY',
+            json.dumps(_json_safe(report['historical']['yearly']), indent=2, ensure_ascii=False),
+            '',
+            'HISTORICAL QUARTERLY',
+            json.dumps(_json_safe(report['historical']['quarterly']), indent=2, ensure_ascii=False),
+            '',
+            'HISTORICAL MONTHLY',
+            json.dumps(_json_safe(report['historical']['monthly']), indent=2, ensure_ascii=False),
+            '',
+            'FORWARD SUMMARY',
+            json.dumps(_json_safe(report['forward']['summary']), indent=2, ensure_ascii=False),
+            '',
+            'FORWARD SKIP REASONS',
+            json.dumps(_json_safe(report['forward']['skip_reasons']), indent=2, ensure_ascii=False),
+            '',
+            'FORWARD WEEKLY',
+            json.dumps(_json_safe(report['forward']['weekly']), indent=2, ensure_ascii=False),
+            '',
+            'SIGNAL AUDIT',
+            json.dumps(_json_safe(report['signal_audit']), indent=2, ensure_ascii=False),
+        ]
+        txt_path.write_text('\\n'.join(lines), encoding='utf-8')
+
+        print(f'Metrics snapshot saved:')
+        print(f'  JSON: {json_path}')
+        print(f'  TXT : {txt_path}')
+        """
+    ),
+}
+
+if len(nb["cells"]) <= 14:
+    nb["cells"].append(export_cell)
+else:
+    nb["cells"][14] = export_cell
+
 NOTEBOOK.write_text(json.dumps(nb, indent=1, ensure_ascii=False), encoding="utf-8")
 print(f"Patched {NOTEBOOK}")
