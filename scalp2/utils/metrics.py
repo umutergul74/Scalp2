@@ -24,12 +24,66 @@ def sortino_ratio(returns: np.ndarray, periods_per_year: int = 35040) -> float:
     return float(np.mean(returns) / downside_std * np.sqrt(periods_per_year))
 
 
+def equity_curve_from_returns(
+    returns: np.ndarray,
+    initial_equity: float = 1.0,
+) -> np.ndarray:
+    """Convert fractional returns into a compounded equity curve."""
+    returns = np.asarray(returns, dtype=np.float64)
+    if returns.size == 0:
+        return np.array([], dtype=np.float64)
+
+    multipliers = np.clip(1.0 + returns, a_min=0.0, a_max=None)
+    return float(max(initial_equity, 0.0)) * np.cumprod(multipliers)
+
+
+def drawdown_series_from_equity(
+    equity: np.ndarray,
+    *,
+    initial_equity: float | None = None,
+) -> np.ndarray:
+    """Peak-relative drawdown series from an equity curve.
+
+    If ``initial_equity`` is provided, it is prepended as a seed point so that
+    the first observed balance can still register a drawdown from the starting
+    capital.
+    """
+    equity = np.asarray(equity, dtype=np.float64)
+    if equity.size == 0:
+        return np.array([], dtype=np.float64)
+
+    if initial_equity is not None:
+        equity = np.concatenate(([float(max(initial_equity, 0.0))], equity))
+
+    equity = np.maximum(equity, 0.0)
+    running_peak = np.maximum.accumulate(equity)
+    drawdown = np.zeros_like(equity)
+    valid_peak = running_peak > 0
+    drawdown[valid_peak] = 1.0 - (equity[valid_peak] / running_peak[valid_peak])
+    drawdown = np.clip(drawdown, 0.0, 1.0)
+
+    if initial_equity is not None:
+        return drawdown[1:]
+    return drawdown
+
+
+def max_drawdown_from_equity(
+    equity: np.ndarray,
+    *,
+    initial_equity: float | None = None,
+) -> float:
+    """Maximum peak-relative drawdown from an equity curve."""
+    drawdown = drawdown_series_from_equity(
+        equity,
+        initial_equity=initial_equity,
+    )
+    return float(drawdown.max()) if drawdown.size > 0 else 0.0
+
+
 def max_drawdown(returns: np.ndarray) -> float:
-    """Maximum drawdown from cumulative returns."""
-    cum = np.cumsum(returns)
-    running_max = np.maximum.accumulate(cum)
-    drawdown = running_max - cum
-    return float(np.max(drawdown)) if len(drawdown) > 0 else 0.0
+    """Maximum peak-relative drawdown from compounded returns."""
+    equity = equity_curve_from_returns(returns, initial_equity=1.0)
+    return max_drawdown_from_equity(equity)
 
 
 def calmar_ratio(returns: np.ndarray, periods_per_year: int = 35040) -> float:

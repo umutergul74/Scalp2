@@ -53,7 +53,15 @@ nb["cells"][2]["source"] = _lines(
 
     from scalp2.config import load_config
     from scalp2.execution.trade_manager import TradeManager, TradeState, TradeStatus
-    from scalp2.utils.metrics import sharpe_ratio, sortino_ratio, max_drawdown, win_rate, profit_factor
+    from scalp2.utils.metrics import (
+        drawdown_series_from_equity,
+        max_drawdown,
+        max_drawdown_from_equity,
+        profit_factor,
+        sharpe_ratio,
+        sortino_ratio,
+        win_rate,
+    )
 
     config = load_config(f'{REPO_DIR}/config.yaml')
     DATA_DIR = '/content/drive/MyDrive/scalp2/data/processed'
@@ -192,10 +200,10 @@ nb["cells"][5]["source"] = _lines(
         down = daily_returns[daily_returns < 0]
         daily_sortino = daily_returns.mean() / (down.std() + 1e-10) * np.sqrt(365) if len(down) else 0.0
 
-        cum = np.array(bar_equity_curve)
-        peak = np.maximum.accumulate(cum)
-        dd = peak - cum
-        mdd = dd.max()
+        mdd = max_drawdown_from_equity(
+            daily_balance.values,
+            initial_equity=bt_initial_balance,
+        )
         calmar = (daily_returns.mean() * 365) / mdd if mdd > 1e-10 else 0.0
 
         status_counts = trades_df['status'].value_counts()
@@ -204,10 +212,7 @@ nb["cells"][5]["source"] = _lines(
         unit_daily = trades_df.assign(date=pd.to_datetime(trades_df['timestamp']).dt.floor('D')).groupby('date')['unit_pnl'].sum()
         unit_full_range = pd.date_range(unit_daily.index.min(), unit_daily.index.max(), freq='D')
         unit_daily = unit_daily.reindex(unit_full_range, fill_value=0.0)
-        unit_cum = np.cumsum(unit_daily.values)
-        unit_peak = np.maximum.accumulate(unit_cum)
-        unit_dd = unit_peak - unit_cum
-        unit_mdd = unit_dd.max()
+        unit_mdd = max_drawdown(unit_daily.values)
 
         print('=' * 60)
         print('       WALK-FORWARD BACKTEST RESULTS')
@@ -274,9 +279,10 @@ nb["cells"][5]["source"] = _lines(
         axes[0].set_ylabel('Cumulative PnL (%)')
         axes[0].grid(True, alpha=0.3)
 
-        daily_peak_balance = daily_balance.cummax()
-        daily_dd = 1.0 - daily_balance / daily_peak_balance.replace(0, np.nan)
-        daily_dd = daily_dd.fillna(0.0)
+        daily_dd = drawdown_series_from_equity(
+            daily_balance.values,
+            initial_equity=bt_initial_balance,
+        )
         axes[1].fill_between(daily_balance.index, 0, -daily_dd * 100, alpha=0.4, color='red')
         axes[1].set_title('Drawdown (Daily Closing Equity)')
         axes[1].set_ylabel('Drawdown (%)')
@@ -302,6 +308,143 @@ nb["cells"][5]["source"] = _lines(
         }, index=monthly_returns.index.to_period('M'))
         print('\\nMonthly Returns:')
         print(monthly.to_string())
+    """
+)
+
+nb["cells"][7]["source"] = _lines(
+    """
+    # Dönem Bazlı Performans Analizi — Modelin gerçek edge'i var mı?
+    if len(trades_df) > 0:
+        trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp'])
+        trades_df['year'] = trades_df['timestamp'].dt.year
+        trades_df['quarter'] = trades_df['timestamp'].dt.to_period('Q')
+
+        # --- Yıllık Performans ---
+        print('=' * 70)
+        print('       YILLIK PERFORMANS KARŞILAŞTIRMASI')
+        print(f'       (Leverage: {LEVERAGE}x)')
+        print('=' * 70)
+
+        yearly_stats = []
+        for year, grp in trades_df.groupby('year'):
+            grp = grp.sort_values('timestamp')
+            net = grp['net_pnl'].values
+            n = len(grp)
+            wins = net[net > 0]
+            losses = net[net < 0]
+            wr = len(wins) / n if n > 0 else 0
+            pf = abs(wins.sum() / losses.sum()) if len(losses) > 0 else float('inf')
+
+            grp_start_balance = float(grp['entry_equity'].iloc[0])
+            grp_daily_balance, grp_daily_returns = _daily_balance_curve(grp, grp_start_balance)
+            sharpe = (
+                grp_daily_returns.mean() / (grp_daily_returns.std() + 1e-10) * np.sqrt(365)
+                if len(grp_daily_returns) > 0
+                else 0.0
+            )
+            mdd = max_drawdown_from_equity(
+                grp_daily_balance.values,
+                initial_equity=grp_start_balance,
+            )
+
+            yearly_stats.append({
+                'Yıl': year, 'İşlem': n, 'Win Rate': f'{wr*100:.1f}%',
+                'Profit Factor': f'{pf:.2f}', 'Sharpe': f'{sharpe:.2f}',
+                'Net PnL': f'{net.sum()*100:.2f}%', 'MDD': f'{mdd*100:.2f}%'
+            })
+
+        yearly_df = pd.DataFrame(yearly_stats)
+        print(yearly_df.to_string(index=False))
+
+        # --- Çeyreklik Performans ---
+        print()
+        print('=' * 70)
+        print('       ÇEYREKLİK PERFORMANS')
+        print('=' * 70)
+
+        quarterly_stats = []
+        for q, grp in trades_df.groupby('quarter'):
+            net = grp['net_pnl'].values
+            n = len(grp)
+            wins = net[net > 0]
+            losses = net[net < 0]
+            wr = len(wins) / n if n > 0 else 0
+            pf = abs(wins.sum() / losses.sum()) if len(losses) > 0 else float('inf')
+            quarterly_stats.append({
+                'Çeyrek': str(q), 'İşlem': n, 'Win Rate': f'{wr*100:.1f}%',
+                'PF': f'{pf:.2f}', 'Net PnL': f'{net.sum()*100:.2f}%'
+            })
+
+        q_df = pd.DataFrame(quarterly_stats)
+        print(q_df.to_string(index=False))
+
+        # --- Yıllık Equity Eğrileri (Overlay) ---
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        colors = plt.cm.tab10(np.linspace(0, 1, len(trades_df['year'].unique())))
+        for idx, (year, grp) in enumerate(trades_df.groupby('year')):
+            grp = grp.sort_values('timestamp')
+            grp_start_balance = float(grp['entry_equity'].iloc[0])
+            grp_daily_balance, _ = _daily_balance_curve(grp, grp_start_balance)
+            cum_pct = (grp_daily_balance / grp_start_balance - 1.0) * 100
+            days = np.arange(len(cum_pct))
+            axes[0].plot(days, cum_pct, label=str(year), color=colors[idx], linewidth=1.2)
+
+        axes[0].set_title('Yıllık Kümülatif PnL Karşılaştırması')
+        axes[0].set_xlabel('Gün (yıl başından)')
+        axes[0].set_ylabel('Kümülatif PnL (%)')
+        axes[0].legend(fontsize=8, ncol=2)
+        axes[0].grid(True, alpha=0.3)
+        axes[0].axhline(0, color='grey', linestyle='--', alpha=0.5)
+
+        years = [s['Yıl'] for s in yearly_stats]
+        wrs = [float(s['Win Rate'].replace('%','')) for s in yearly_stats]
+        bar_colors = ['#4CAF50' if w > 55 else '#FF9800' if w > 45 else '#F44336' for w in wrs]
+        axes[1].bar(range(len(years)), wrs, color=bar_colors, edgecolor='white')
+        axes[1].set_xticks(range(len(years)))
+        axes[1].set_xticklabels(years)
+        axes[1].set_title('Yıllık Win Rate')
+        axes[1].set_ylabel('Win Rate (%)')
+        axes[1].axhline(50, color='red', linestyle='--', alpha=0.5, label='50% (rastgele)')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3, axis='y')
+
+        plt.tight_layout()
+        plt.show()
+
+        # --- Tutarlılık Değerlendirmesi ---
+        print()
+        print('=' * 70)
+        print('       MODEL TUTARLILIK DEĞERLENDİRMESİ')
+        print('=' * 70)
+        win_rates = [float(s['Win Rate'].replace('%',''))/100 for s in yearly_stats]
+        pfs = [float(s['Profit Factor']) for s in yearly_stats if s['Profit Factor'] != 'inf']
+
+        wr_std = np.std(win_rates)
+        wr_mean = np.mean(win_rates)
+        pf_std = np.std(pfs) if pfs else 0
+        pf_mean = np.mean(pfs) if pfs else 0
+
+        print(f'  Win Rate: Ort={wr_mean*100:.1f}%, Std={wr_std*100:.1f}%')
+        print(f'  Profit Factor: Ort={pf_mean:.2f}, Std={pf_std:.2f}')
+        print()
+
+        all_positive = all(float(s['Net PnL'].replace('%','')) > 0 for s in yearly_stats)
+        low_variance = wr_std < 0.08
+
+        if all_positive and low_variance:
+            print('  ✅ GÜÇLÜ: Model TÜM yıllarda pozitif ve tutarlı.')
+            print('  → Gerçek tahmin gücü (edge) var, look-ahead bias yok.')
+        elif all_positive:
+            print('  ⚠️ ORTA: Tüm yıllar pozitif ama performans değişkenliği yüksek.')
+            print('  → Edge var ama bazı dönemlerde zayıflıyor (regime-dependent).')
+        else:
+            neg_years = [s['Yıl'] for s in yearly_stats if float(s['Net PnL'].replace('%','')) <= 0]
+            print(f'  ❌ ZAYIF: Negatif yıllar var ({neg_years}).')
+            print('  → Model belirli market yapılarına overfit olmuş olabilir.')
+        print('=' * 70)
+    else:
+        print("İşlem yok — analiz yapılamadı.")
     """
 )
 
@@ -698,9 +841,10 @@ nb["cells"][11]["source"] = _lines(
         fwd_pf = abs(fwd_wins.sum() / fwd_losses.sum()) if len(fwd_losses) else float('inf')
 
         fwd_sharpe = fwd_daily_returns.mean() / (fwd_daily_returns.std() + 1e-10) * np.sqrt(365)
-        fwd_curve = np.array(fwd_bar_equity)
-        fwd_peak = np.maximum.accumulate(fwd_curve)
-        fwd_mdd = (fwd_peak - fwd_curve).max()
+        fwd_mdd = max_drawdown_from_equity(
+            fwd_daily_balance.values,
+            initial_equity=fwd_initial_balance,
+        )
         n_days = len(fwd_daily_returns)
 
         print()
@@ -755,9 +899,10 @@ nb["cells"][11]["source"] = _lines(
         axes[0].set_ylabel('Cumulative PnL (%)')
         axes[0].grid(True, alpha=0.3)
 
-        fwd_peak_balance = fwd_daily_balance.cummax()
-        fwd_dd_daily = 1.0 - fwd_daily_balance / fwd_peak_balance.replace(0, np.nan)
-        fwd_dd_daily = fwd_dd_daily.fillna(0.0)
+        fwd_dd_daily = drawdown_series_from_equity(
+            fwd_daily_balance.values,
+            initial_equity=fwd_initial_balance,
+        )
         axes[1].fill_between(fwd_daily_balance.index, 0, -fwd_dd_daily * 100, alpha=0.4, color='red')
         axes[1].set_title('Forward Test Drawdown')
         axes[1].set_ylabel('Drawdown (%)')
