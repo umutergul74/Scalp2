@@ -258,6 +258,7 @@ def _simulate_prediction_stream(
     confidence_threshold: float | None = None,
     initial_balance: float = DEFAULT_INITIAL_BALANCE,
     label: str = "",
+    reset_guards_on_fold_change: bool = False,
 ) -> dict:
     """Replay the strategy over a chronological stream of class probabilities."""
     df_bt = _ensure_backtest_columns(df, config)
@@ -284,6 +285,8 @@ def _simulate_prediction_stream(
     active: TradeState | None = None
     active_meta: dict | None = None
     pending: dict | None = None
+    current_fold_idx: int | None = None
+    pending_fold_reset: int | None = None
     daily_trade_count = 0
     prev_date = None
     liquidated = False
@@ -298,6 +301,14 @@ def _simulate_prediction_stream(
         if current_date != prev_date:
             daily_trade_count = 0
             prev_date = current_date
+
+        prediction = prediction_map.get(bar)
+        incoming_fold_idx = prediction.fold_idx if prediction is not None else None
+        if reset_guards_on_fold_change and incoming_fold_idx is not None:
+            if current_fold_idx is None:
+                current_fold_idx = incoming_fold_idx
+            elif incoming_fold_idx != current_fold_idx:
+                pending_fold_reset = incoming_fold_idx
 
         trade_mgr.advance_bar()
 
@@ -436,10 +447,24 @@ def _simulate_prediction_stream(
         elif active is None:
             bar_equity_curve.append((current_balance - initial_balance) / initial_balance)
 
+        if (
+            reset_guards_on_fold_change
+            and pending_fold_reset is not None
+            and active is None
+            and pending is None
+        ):
+            trade_mgr = TradeManager(
+                config.execution.trade_management,
+                config.labeling.max_holding_bars,
+            )
+            risk_mgr = RiskManager(config=config.execution)
+            current_fold_idx = pending_fold_reset
+            pending_fold_reset = None
+            daily_trade_count = 0
+
         if active is not None:
             continue
 
-        prediction = prediction_map.get(bar)
         if prediction is None:
             continue
 
@@ -590,6 +615,7 @@ def simulate_walk_forward_backtest(
         signal_start_bar=start_bar,
         initial_balance=initial_balance,
         label="walk_forward",
+        reset_guards_on_fold_change=True,
     )
 
 

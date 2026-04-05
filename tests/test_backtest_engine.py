@@ -123,6 +123,51 @@ def test_walk_forward_backtest_can_finish_trade_after_last_prediction_bar():
     assert trade["status"] == "TIME"
 
 
+def test_walk_forward_backtest_resets_risk_halt_on_fold_change():
+    config = _base_config()
+    config.model.seq_len = 1
+    config.labeling.max_holding_bars = 10
+    config.execution.risk_limits.drawdown_halt_pct = 1.0
+
+    index = pd.date_range("2026-01-01", periods=6, freq="15min")
+    df = pd.DataFrame(
+        {
+            "open": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+            "high": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+            "low": [100.0, 100.0, 99.0, 100.0, 100.0, 100.0],
+            "close": [100.0, 100.0, 100.0, 100.0, 100.0, 100.0],
+            "atr_14": [1.0] * 6,
+            "adx": [40.0] * 6,
+        },
+        index=index,
+    )
+    wf_predictions = [
+        {
+            "fold_idx": 0,
+            "test_start": 0,
+            "test_probabilities": np.array([[0.01, 0.00, 0.99]], dtype=np.float32),
+            "regime_probs": np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        },
+        {
+            "fold_idx": 1,
+            "test_start": 3,
+            "test_probabilities": np.array([[0.01, 0.00, 0.99]], dtype=np.float32),
+            "regime_probs": np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
+        },
+    ]
+
+    result = simulate_walk_forward_backtest(
+        df=df,
+        wf_predictions=wf_predictions,
+        config=config,
+        initial_balance=1000.0,
+    )
+
+    assert len(result["trades_df"]) == 2
+    assert list(result["trades_df"]["status"]) == ["SL", "EOD"]
+    assert "risk_halt" not in result["skip_reasons"]
+
+
 def test_forward_backtest_closes_last_open_trade_at_end_of_data():
     config = _base_config()
     config.labeling.max_holding_bars = 10
