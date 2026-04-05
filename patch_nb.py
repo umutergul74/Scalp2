@@ -23,7 +23,10 @@ nb["cells"][2]["source"] = _lines(
     import os, sys, json
 
     REPO_DIR = '/content/scalp2_repo'
-    REPO_REF = os.environ.get('SCALP2_GIT_REF', 'main')
+    REPO_REF = os.environ.get(
+        'SCALP2_GIT_REF',
+        'codex/backtest-paper-safety-20260405',
+    )
 
     if not os.path.exists(os.path.join(REPO_DIR, '.git')):
         !git clone https://github.com/sergul74/Scalp2.git {REPO_DIR}
@@ -35,7 +38,7 @@ nb["cells"][2]["source"] = _lines(
     if not os.path.exists(os.path.join(REPO_DIR, 'scalp2', '__init__.py')):
         raise FileNotFoundError('scalp2 package not found after clone!')
 
-    print(f'Using repo ref: {REPO_REF}')
+    print(f'Using repo ref: {REPO_REF} (override with SCALP2_GIT_REF)')
     !git -C {REPO_DIR} rev-parse --short HEAD
 
     sys.path.insert(0, REPO_DIR)
