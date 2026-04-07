@@ -453,14 +453,11 @@ def _simulate_prediction_stream(
             and active is None
             and pending is None
         ):
-            trade_mgr = TradeManager(
-                config.execution.trade_management,
-                config.labeling.max_holding_bars,
-            )
-            risk_mgr = RiskManager(config=config.execution)
+            # Only reset the drawdown halt (simulates operator intervention)
+            # All other guards (consecutive SL, cooldown, price distance) persist
+            risk_mgr.reset_halt()
             current_fold_idx = pending_fold_reset
             pending_fold_reset = None
-            daily_trade_count = 0
 
         if active is not None:
             continue
@@ -615,7 +612,7 @@ def simulate_walk_forward_backtest(
         signal_start_bar=start_bar,
         initial_balance=initial_balance,
         label="walk_forward",
-        reset_guards_on_fold_change=False,
+        reset_guards_on_fold_change=True,
     )
 
 
