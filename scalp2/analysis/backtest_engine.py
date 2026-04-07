@@ -615,7 +615,7 @@ def simulate_walk_forward_backtest(
         signal_start_bar=start_bar,
         initial_balance=initial_balance,
         label="walk_forward",
-        reset_guards_on_fold_change=True,
+        reset_guards_on_fold_change=False,
     )
 
 
