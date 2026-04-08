@@ -192,9 +192,11 @@ class RiskManager:
     def reset_halt(self) -> None:
         """Manually reset a drawdown halt (requires human intervention)."""
         if self._halted:
-            logger.warning("Risk halt MANUALLY reset by operator")
+            logger.warning("Risk halt MANUALLY reset by operator. Resetting high-water mark.")
             self._halted = False
             self._halt_reason = ""
+            # FIX: Reset the peak tracking so current_dd becomes 0, avoiding instant re-halt
+            self._peak_pnl_pct = self._cumulative_pnl_pct
 
     def get_daily_summary(self, timestamp: datetime) -> dict:
         """Get summary of today's trading activity."""
