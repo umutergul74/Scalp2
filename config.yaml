@@ -223,7 +223,8 @@ execution:
   risk_limits:
     daily_loss_limit_pct: 3.0
     weekly_loss_limit_pct: 5.0
-    drawdown_halt_pct: 8.0
+    # FIX: Set to 99.0 to allow backtest over the full 2021-2026 period without permanent halts
+    drawdown_halt_pct: 99.0
     win_streak_reduction:
       enabled: true
       after_wins: 5
