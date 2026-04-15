@@ -54,7 +54,7 @@ labeling:
   method: "triple_barrier"
   tp_multiplier: 1.5
   sl_multiplier: 0.8
-  max_holding_bars: 10
+  max_holding_bars: 4
   min_return_threshold: 0.0005
   atr_period: 14
 
