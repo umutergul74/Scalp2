@@ -17,8 +17,13 @@ def align_mtf_features(
 ) -> pd.DataFrame:
     """Align higher-timeframe features onto the primary timeframe index.
 
-    Uses merge_asof with direction='backward' to ensure only completed
-    HTF bars are used — this prevents look-ahead bias.
+    Uses merge_asof with direction='backward' on SHIFTED timestamps to
+    ensure only COMPLETED HTF bars are used — preventing look-ahead bias.
+
+    Without the shift, a 4h bar labeled 08:00 (covering 08:00-11:59)
+    would be matched to a 15m bar at 08:15, leaking ~3h44m of future data.
+    By shifting the HTF timestamp forward by one period, that 4h bar becomes
+    12:00 and is only matched to 15m bars at 12:00+, when it's fully closed.
 
     Args:
         df_primary: Primary timeframe DataFrame (e.g. 15m), indexed by timestamp.
@@ -57,6 +62,17 @@ def align_mtf_features(
     htf_ts_col = htf_reset.columns[0]
     htf_reset = htf_reset.rename(columns={htf_ts_col: ts_col})
 
+    # FIX: Shift HTF timestamps forward by one period so that only
+    # COMPLETED bars are matched. A bar labeled 10:00 in the 1h timeframe
+    # covers 10:00-10:59. By shifting to 11:00, merge_asof will only
+    # match it to 15m bars at 11:00+, when the bar is fully closed.
+    htf_offset = pd.tseries.frequencies.to_offset(htf_label)
+    htf_reset[ts_col] = htf_reset[ts_col] + htf_offset
+    logger.info(
+        "Shifted %s timestamps forward by %s to prevent look-ahead bias",
+        htf_label, htf_offset,
+    )
+
     merged = pd.merge_asof(
         primary_reset.sort_values(ts_col),
         htf_reset.sort_values(ts_col),
@@ -66,7 +82,7 @@ def align_mtf_features(
     merged = merged.set_index(ts_col)
 
     logger.info(
-        "Aligned %d %s features onto primary timeframe (%d rows)",
+        "Aligned %d %s features onto primary timeframe (%d rows, bias-free)",
         len(feature_cols),
         htf_label,
         len(merged),
