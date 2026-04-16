@@ -16,18 +16,18 @@ def true_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
         Market Sell Vol = Total Volume - Market Buy Vol
         True Delta = Market Buy Vol - Market Sell Vol
     """
-    if "taker_buy_base_vol" not in df.columns or "volume" not in df.columns:
-        return pd.DataFrame(index=df.index)
-
-    # Calculate exact aggressive volume directions
-    buy_vol = df["taker_buy_base_vol"]
-    sell_vol = df["volume"] - buy_vol
-    
-    # Delta (Net Aggressive Flow)
-    delta = buy_vol - sell_vol
-    
-    # Ratios
-    buy_ratio = buy_vol / (df["volume"] + 1e-10)
+    if "taker_buy_base_vol" in df.columns and "volume" in df.columns:
+        # EXACT MODE: We have Binance's true taker volume
+        buy_vol = df["taker_buy_base_vol"]
+        sell_vol = df["volume"] - buy_vol
+        delta = buy_vol - sell_vol
+        buy_ratio = buy_vol / (df["volume"] + 1e-10)
+    else:
+        # PROXY MODE: Graceful degradation if CSV lacks taker data
+        hl_range = df["high"] - df["low"]
+        hl_range = hl_range.replace(0, np.nan).ffill()
+        delta = df["volume"] * (2 * df["close"] - df["high"] - df["low"]) / (hl_range + 1e-10)
+        buy_ratio = (delta + df["volume"]) / (2 * df["volume"] + 1e-10)
     
     # Cumulative Volume Delta (CVD)
     cvd = delta.cumsum()
@@ -36,11 +36,10 @@ def true_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
     cvd_sma = cvd.rolling(20, min_periods=20).mean()
     cvd_divergence = cvd - cvd_sma
     
-    # Price - CVD absorption flag (Price goes one way, CVD goes the other)
-    # E.g. Strong buying (positive delta) but price dropped = Absorption by passive sellers
+    # Price - CVD absorption flag
     price_delta = df["close"].diff()
-    absorption_bullish = (delta < 0) & (price_delta > 0) # Selling pressure absorbed, price up
-    absorption_bearish = (delta > 0) & (price_delta < 0) # Buying pressure absorbed, price down
+    absorption_bullish = (delta < 0) & (price_delta > 0)
+    absorption_bearish = (delta > 0) & (price_delta < 0)
     
     # Normalize delta
     delta_zscore = (
@@ -68,12 +67,14 @@ def whale_detector(df: pd.DataFrame) -> pd.DataFrame:
     If volume per trade spikes, large players are active.
     """
     if "num_trades" not in df.columns or "volume" not in df.columns:
-        return pd.DataFrame(index=df.index)
-        
-    trades = df["num_trades"].replace(0, 1) # Prevent div zero
-    
-    # Overall volume per trade (ticket size)
-    vpt = df["volume"] / trades
+        # Fallback if num_trades is missing
+        vpt = df["volume"]
+        trades = pd.Series(1, index=df.index)
+        high_activity = pd.Series(0, index=df.index)
+    else:
+        trades = df["num_trades"].replace(0, 1) # Prevent div zero
+        vpt = df["volume"] / trades
+        high_activity = (trades > trades.rolling(50).mean() * 1.5).astype(np.float32)
     
     # Spike detection (Volume per trade z-score)
     vpt_zscore = (
