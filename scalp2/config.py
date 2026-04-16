@@ -76,7 +76,8 @@ class VolatilityConfig:
 
 @dataclass
 class OrderFlowConfig:
-    cvd_proxy: bool = True
+    true_orderflow: bool = True
+    whale_detector: bool = True
     funding_rate: bool = True
     open_interest: bool = True
 

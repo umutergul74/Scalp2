@@ -109,6 +109,7 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
         "cvd_divergence",       # cumulative - SMA(cumulative) = still non-stationary
         "volume_sma_20",
         "oi_delta",
+        "vol_per_trade",        # drifting ticket size due to macro BTC price changes
         
         # Unbounded counters
         "bars_since_sweep",     # grows without bound (can reach thousands)

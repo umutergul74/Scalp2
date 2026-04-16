@@ -41,7 +41,8 @@ features:
     parkinson_window: 14
 
   orderflow:
-    cvd_proxy: true
+    true_orderflow: true
+    whale_detector: true
     funding_rate: true
     open_interest: true
 

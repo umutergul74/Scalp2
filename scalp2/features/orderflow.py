@@ -1,4 +1,4 @@
-"""Order flow proxy features — CVD, funding rate, open interest."""
+"""Market Microstructure and Order Flow features."""
 
 from __future__ import annotations
 
@@ -8,42 +8,90 @@ import pandas as pd
 from scalp2.config import OrderFlowConfig
 
 
-def cumulative_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute CVD proxy from OHLCV data.
+def true_volume_delta(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute exact CVD and volume imbalance using Binance taker data.
 
-    Formula: delta = volume * (2*close - high - low) / (high - low)
-
-    When close is near the high, most volume is interpreted as buying.
-    When close is near the low, most volume is interpreted as selling.
-
-    Args:
-        df: OHLCV DataFrame.
-
-    Returns:
-        DataFrame with cvd_delta, cvd_cumulative, and cvd_sma columns.
+    Binance provides exact market buy volume (`taker_buy_base_vol`).
+    Therefore:
+        Market Sell Vol = Total Volume - Market Buy Vol
+        True Delta = Market Buy Vol - Market Sell Vol
     """
-    hl_range = df["high"] - df["low"]
-    # Avoid division by zero for doji candles
-    hl_range = hl_range.replace(0, np.nan).ffill()
+    if "taker_buy_base_vol" not in df.columns or "volume" not in df.columns:
+        return pd.DataFrame(index=df.index)
 
-    delta = df["volume"] * (2 * df["close"] - df["high"] - df["low"]) / (hl_range + 1e-10)
-
+    # Calculate exact aggressive volume directions
+    buy_vol = df["taker_buy_base_vol"]
+    sell_vol = df["volume"] - buy_vol
+    
+    # Delta (Net Aggressive Flow)
+    delta = buy_vol - sell_vol
+    
+    # Ratios
+    buy_ratio = buy_vol / (df["volume"] + 1e-10)
+    
+    # Cumulative Volume Delta (CVD)
     cvd = delta.cumsum()
+    
+    # CVD Divergence (CVD trend vs short SMA)
     cvd_sma = cvd.rolling(20, min_periods=20).mean()
     cvd_divergence = cvd - cvd_sma
+    
+    # Price - CVD absorption flag (Price goes one way, CVD goes the other)
+    # E.g. Strong buying (positive delta) but price dropped = Absorption by passive sellers
+    price_delta = df["close"].diff()
+    absorption_bullish = (delta < 0) & (price_delta > 0) # Selling pressure absorbed, price up
+    absorption_bearish = (delta > 0) & (price_delta < 0) # Buying pressure absorbed, price down
+    
+    # Normalize delta
+    delta_zscore = (
+        (delta - delta.rolling(20, min_periods=20).mean())
+        / (delta.rolling(20, min_periods=20).std() + 1e-10)
+    )
 
     return pd.DataFrame(
         {
             "cvd_delta": delta.astype(np.float32),
             "cvd_cumulative": cvd.astype(np.float32),
             "cvd_divergence": cvd_divergence.astype(np.float32),
-            "cvd_delta_zscore": (
-                (delta - delta.rolling(20, min_periods=20).mean())
-                / (delta.rolling(20, min_periods=20).std() + 1e-10)
-            ).astype(np.float32),
+            "cvd_delta_zscore": delta_zscore.astype(np.float32),
+            "taker_buy_ratio": buy_ratio.astype(np.float32),
+            "absorb_bull": absorption_bullish.astype(np.float32),
+            "absorb_bear": absorption_bearish.astype(np.float32),
         },
         index=df.index,
+    ).ffill().fillna(0)
+
+
+def whale_detector(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute volume per trade to detect institutional activity.
+    
+    If volume per trade spikes, large players are active.
+    """
+    if "num_trades" not in df.columns or "volume" not in df.columns:
+        return pd.DataFrame(index=df.index)
+        
+    trades = df["num_trades"].replace(0, 1) # Prevent div zero
+    
+    # Overall volume per trade (ticket size)
+    vpt = df["volume"] / trades
+    
+    # Spike detection (Volume per trade z-score)
+    vpt_zscore = (
+        (vpt - vpt.rolling(50, min_periods=20).mean())
+        / (vpt.rolling(50, min_periods=20).std() + 1e-10)
     )
+    
+    # Is activity high?
+    high_activity = (trades > trades.rolling(50).mean() * 1.5).astype(np.float32)
+
+    return pd.DataFrame(
+        {
+            "vol_per_trade": vpt.astype(np.float32),
+            "vpt_zscore": vpt_zscore.astype(np.float32),
+            "high_activity": high_activity,
+        },
+        index=df.index,
+    ).ffill().fillna(0)
 
 
 def align_funding_rate(
@@ -62,7 +110,7 @@ def align_funding_rate(
     """
     result = df_primary.copy()
 
-    if funding_df.empty:
+    if funding_df is None or funding_df.empty:
         result["funding_rate"] = np.float32(0)
         result["funding_rate_ma"] = np.float32(0)
         result["funding_rate_zscore"] = np.float32(0)
@@ -146,9 +194,15 @@ def compute_all_orderflow(
     """
     result = df.copy()
 
-    if config.cvd_proxy:
-        cvd_features = cumulative_volume_delta(df)
-        result = pd.concat([result, cvd_features], axis=1)
+    if config.true_orderflow:
+        cvd_features = true_volume_delta(df)
+        if not cvd_features.empty and len(cvd_features.columns) > 0:
+            result = pd.concat([result, cvd_features], axis=1)
+
+    if getattr(config, "whale_detector", False):
+        whale_features = whale_detector(df)
+        if not whale_features.empty and len(whale_features.columns) > 0:
+            result = pd.concat([result, whale_features], axis=1)
 
     if config.funding_rate and funding_df is not None:
         result = align_funding_rate(funding_df, result)
