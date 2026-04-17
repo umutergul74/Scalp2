@@ -99,6 +99,7 @@ model:
     eval_metric: "mlogloss"
     early_stopping_rounds: 30
 
+  bypass_xgboost: true    # Use raw TCN+GRU logits instead of XGBoost meta-learner
   handcrafted_top_k: 40
 
 training:

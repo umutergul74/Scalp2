@@ -110,6 +110,8 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
         "volume_sma_20",
         "oi_delta",
         "vol_per_trade",        # drifting ticket size due to macro BTC price changes
+        "kyle_lambda",          # raw λ drifts with volume scale
+        "amihud",               # raw Amihud drifts with dollar volume
         
         # Unbounded counters
         "bars_since_sweep",     # grows without bound (can reach thousands)

@@ -164,6 +164,7 @@ class ModelConfig:
     gru: GRUConfig = field(default_factory=GRUConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     xgboost: XGBoostConfig = field(default_factory=XGBoostConfig)
+    bypass_xgboost: bool = False
     handcrafted_top_k: int = 40
 
 
