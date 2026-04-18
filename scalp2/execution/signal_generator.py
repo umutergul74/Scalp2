@@ -132,16 +132,21 @@ class SignalGenerator:
 
         # 3. Run model inference (always — so we always have probabilities)
         x = torch.from_numpy(features_scaled).unsqueeze(0).to(self.device)
+        
         with torch.no_grad():
-            latent = self.model.extract_latent(x).cpu().numpy()
+            if getattr(self.config.model, "bypass_xgboost", False):
+                logits, _ = self.model(x)
+                # Raw TCN+GRU probabilities
+                probs = torch.nn.functional.softmax(logits, dim=1)[0].cpu().numpy()
+            else:
+                latent = self.model.extract_latent(x).cpu().numpy()
+                handcrafted = features_scaled[-1:, self.top_feature_indices]
+                regime_input = regime_probs[-1:].astype(np.float32)
+                meta_features = XGBoostMetaLearner.build_meta_features(
+                    latent, handcrafted, regime_input
+                )
+                probs = self.meta_learner.predict_proba(meta_features)[0]
 
-        handcrafted = features_scaled[-1:, self.top_feature_indices]
-        regime_input = regime_probs[-1:].astype(np.float32)
-        meta_features = XGBoostMetaLearner.build_meta_features(
-            latent, handcrafted, regime_input
-        )
-
-        probs = self.meta_learner.predict_proba(meta_features)[0]
         prob_dict = {"short": float(probs[0]), "hold": float(probs[1]), "long": float(probs[2])}
 
         # 4. Check choppy regime (with ADX override)
