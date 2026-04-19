@@ -121,6 +121,17 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
         "swing_high_price", "swing_low_price",
     }
     
+    # Hard-drop list from Phase 1 Feature Forensics (IC10 < 0.005)
+    empirical_noise_drops = {
+        "fvg_bullish", "4h_atr_pct", "vol_zscore", "vpt_zscore", "adx", 
+        "4h_sweep_low", "1h_fvg_bull_dist", "volume_zscore", "1h_vpin_zscore", 
+        "fvg_bear_dist", "1h_volume_ratio", "1h_volume_zscore", "4h_plus_di", 
+        "volume_noise", "1h_absorb_bear", "vpin", "4h_park_vol_14", "4h_fvg_bullish", 
+        "1h_vpt_zscore", "4h_volume_noise", "4h_gk_vol_14", "volume_ratio", 
+        "1h_high_activity", "4h_vpin_zscore", "4h_vol_ratio", "fvg_bull_dist", 
+        "4h_vpt_zscore", "absorb_bear", "1h_volume_noise", "high_activity", "4h_minus_di"
+    }
+    
     # Base prefixes to drop (after stripping MTF prefix)
     drop_prefixes = ("ema_", "atr_")
     # Suffixes that make an otherwise-dropped column safe (stationary)
@@ -129,7 +140,10 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
     mtf_prefixes = ("1h_", "4h_", "1d_")
     
     def _is_non_stationary(col: str) -> bool:
-        """Check if a column (with or without MTF prefix) is non-stationary."""
+        """Check if a column (with or without MTF prefix) is non-stationary or noise."""
+        if col in empirical_noise_drops:
+            return True
+            
         # Strip MTF prefix to get the base column name
         base = col
         for pfx in mtf_prefixes:
