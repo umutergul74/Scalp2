@@ -157,7 +157,7 @@ regime:
   features: ["log_return", "gk_vol_14", "adx", "cvd_delta_zscore", "vwap_dist_atr"]
   covariance_type: "full"
   n_iter: 100
-  choppy_threshold: 0.65
+  choppy_threshold: 0.85
   online_update_enabled: true
   online_decay_factor: 0.995
   online_update_interval: 48
@@ -165,14 +165,14 @@ regime:
 
 execution:
   time_of_day_filter:
-    enabled: true
+    enabled: false
     blocked_hours_utc: [3, 4]
 
-  confidence_threshold: 0.38
-  max_trades_per_day: 10
-  min_adx: 15
-  min_atr_percentile: 0.03
-  choppy_adx_override: 28
+  confidence_threshold: 0.35
+  max_trades_per_day: 12
+  min_adx: 10
+  min_atr_percentile: 0.02
+  choppy_adx_override: 22
   regime_direction_filter: true
 
   order_execution:
@@ -212,14 +212,14 @@ execution:
       low_vol_sl_scale: 0.85
     cooldown:
       enabled: true
-      bars_after_sl: 3
-      bars_after_regime_close: 2
+      bars_after_sl: 2
+      bars_after_regime_close: 1
     price_distance_block:
-      enabled: true
+      enabled: false
       min_atr_distance: 0.5
     consecutive_sl_cap:
-      enabled: true
-      max_consecutive: 5
+      enabled: false
+      max_consecutive: 50
       reset_after_win: true
 
   risk_limits:
