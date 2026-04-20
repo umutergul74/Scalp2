@@ -168,11 +168,11 @@ execution:
     enabled: true
     blocked_hours_utc: [3, 4]
 
-  confidence_threshold: 0.50
-  max_trades_per_day: 8
-  min_adx: 20
-  min_atr_percentile: 0.05
-  choppy_adx_override: 35
+  confidence_threshold: 0.38
+  max_trades_per_day: 10
+  min_adx: 15
+  min_atr_percentile: 0.03
+  choppy_adx_override: 28
   regime_direction_filter: true
 
   order_execution:
@@ -212,14 +212,14 @@ execution:
       low_vol_sl_scale: 0.85
     cooldown:
       enabled: true
-      bars_after_sl: 6
-      bars_after_regime_close: 4
+      bars_after_sl: 3
+      bars_after_regime_close: 2
     price_distance_block:
       enabled: true
       min_atr_distance: 0.5
     consecutive_sl_cap:
       enabled: true
-      max_consecutive: 3
+      max_consecutive: 5
       reset_after_win: true
 
   risk_limits:

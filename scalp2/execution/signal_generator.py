@@ -132,12 +132,13 @@ class SignalGenerator:
 
         # 3. Run model inference (always — so we always have probabilities)
         x = torch.from_numpy(features_scaled).unsqueeze(0).to(self.device)
-        
+
         with torch.no_grad():
             if getattr(self.config.model, "bypass_xgboost", False):
+                # GOD MODE: Use raw TCN+GRU softmax — no XGBoost degradation
                 logits, _ = self.model(x)
-                # Raw TCN+GRU probabilities
                 probs = torch.nn.functional.softmax(logits, dim=1)[0].cpu().numpy()
+                logger.debug("Bypass XGBoost: using raw Stage-1 softmax")
             else:
                 latent = self.model.extract_latent(x).cpu().numpy()
                 handcrafted = features_scaled[-1:, self.top_feature_indices]
