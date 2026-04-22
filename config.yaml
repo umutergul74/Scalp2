@@ -53,17 +53,17 @@ features:
 
 labeling:
   method: "triple_barrier"
-  tp_multiplier: 1.5
-  sl_multiplier: 0.8
-  max_holding_bars: 4
+  tp_multiplier: 2.0
+  sl_multiplier: 1.2
+  max_holding_bars: 10
   min_return_threshold: 0.0005
   atr_period: 14
 
 model:
-  seq_len: 64
+  seq_len: 128
 
   tcn:
-    num_channels: [64, 64, 64, 64]
+    num_channels: [64, 128, 128, 128, 128]
     kernel_size: 3
     dropout: 0.3
     spatial_dropout: true
@@ -71,15 +71,15 @@ model:
     stochastic_depth: 0.1
 
   gru:
-    hidden_size: 128
-    num_layers: 2
+    hidden_size: 192
+    num_layers: 3
     dropout: 0.3
     bidirectional: false
     attention_pooling: true
 
   fusion:
-    latent_dim: 64
-    bottleneck_dim: 32
+    latent_dim: 96
+    bottleneck_dim: 48
     dropout: 0.4
 
   xgboost:
@@ -105,8 +105,8 @@ model:
 training:
   optimizer:
     type: "AdamW"
-    lr: 1.0e-3
-    weight_decay: 5.0e-4
+    lr: 5.0e-4
+    weight_decay: 1.0e-3
     betas: [0.9, 0.999]
 
   scheduler:
@@ -114,12 +114,12 @@ training:
     patience: 5
     factor: 0.5
     min_lr: 1.0e-6
-    T_0: 10
+    T_0: 15
     T_mult: 2
-    warmup_epochs: 3
+    warmup_epochs: 5
 
-  batch_size: 256
-  max_epochs: 100
+  batch_size: 128
+  max_epochs: 150
   gradient_clip_norm: 1.0
   use_amp: true
 
@@ -189,12 +189,12 @@ execution:
     maintenance_margin: 0.005
 
   trade_management:
-    partial_tp_1_atr: 0.5
+    partial_tp_1_atr: 0.8
     partial_tp_1_pct: 0.5
     full_tp_atr: 2.0
-    breakeven_trigger_atr: 0.5
-    trailing_activation_atr: 0.8
-    trailing_distance_atr: 0.4
+    breakeven_trigger_atr: 0.8
+    trailing_activation_atr: 1.2
+    trailing_distance_atr: 0.6
     structural_exit:
       enabled: true
       fvg_proximity_atr: 0.3
