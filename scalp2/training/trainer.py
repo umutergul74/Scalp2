@@ -18,6 +18,7 @@ from scalp2.data.dataset import ScalpDataset, create_dataloaders
 from scalp2.losses.center_loss import CenterLoss
 from scalp2.losses.contrastive_loss import SupConLoss
 from scalp2.losses.log_mdd_loss import LogMDDLoss, compute_combined_loss
+from scalp2.losses.rank_ic_loss import RankICLoss
 from scalp2.losses.sharpe_loss import SharpeLoss
 from scalp2.models.hybrid import HybridEncoder
 from scalp2.training.callbacks import EarlyStopping, ModelCheckpoint
@@ -144,6 +145,10 @@ class Stage1Trainer:
         self.focal_gamma = config.loss.focal_gamma
         self.center_loss_weight = config.loss.center_loss_weight
 
+        # RankIC loss — directly optimize IC
+        self.rank_ic_weight = getattr(config.loss, 'rank_ic_weight', 0.0)
+        self.rank_ic_loss_fn = RankICLoss() if self.rank_ic_weight > 0 else None
+
         # Center loss — initialized per fold in train_one_fold
         self.center_loss_fn = None
 
@@ -152,7 +157,7 @@ class Stage1Trainer:
 
         logger.info(
             "Stage1Trainer initialized: device=%s, AMP=%s, params=%d, "
-            "scheduler=%s, focal_gamma=%.1f, contrastive=%.2f, center=%.2f",
+            "scheduler=%s, focal_gamma=%.1f, contrastive=%.2f, center=%.2f, rank_ic=%.2f",
             self.device,
             self.use_amp,
             model.count_parameters(),
@@ -160,6 +165,7 @@ class Stage1Trainer:
             self.focal_gamma,
             self.contrastive_weight,
             self.center_loss_weight,
+            self.rank_ic_weight,
         )
 
     def _compute_alpha(self, epoch: int) -> float:
@@ -302,9 +308,11 @@ class Stage1Trainer:
                     class_weights, alpha, self.aux_loss_fn,
                     contrastive_loss_fn=self.contrastive_loss_fn,
                     center_loss_fn=self.center_loss_fn,
+                    rank_ic_loss_fn=self.rank_ic_loss_fn,
                     latent=latent,
                     contrastive_weight=self.contrastive_weight,
                     center_loss_weight=self.center_loss_weight,
+                    rank_ic_weight=self.rank_ic_weight,
                     label_smoothing=self.label_smoothing,
                     focal_gamma=self.focal_gamma,
                 )
@@ -346,9 +354,11 @@ class Stage1Trainer:
                     class_weights, alpha, self.aux_loss_fn,
                     contrastive_loss_fn=self.contrastive_loss_fn,
                     center_loss_fn=self.center_loss_fn,
+                    rank_ic_loss_fn=self.rank_ic_loss_fn,
                     latent=latent,
                     contrastive_weight=self.contrastive_weight,
                     center_loss_weight=self.center_loss_weight,
+                    rank_ic_weight=self.rank_ic_weight,
                     label_smoothing=self.label_smoothing,
                     focal_gamma=self.focal_gamma,
                 )

@@ -51,32 +51,37 @@ def compute_combined_loss(
     auxiliary_loss_fn: nn.Module,
     contrastive_loss_fn: nn.Module | None = None,
     center_loss_fn: nn.Module | None = None,
+    rank_ic_loss_fn: nn.Module | None = None,
     latent: torch.Tensor | None = None,
     contrastive_weight: float = 0.0,
     center_loss_weight: float = 0.0,
+    rank_ic_weight: float = 0.0,
     label_smoothing: float = 0.0,
     focal_gamma: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Compute combined Focal/CE + SupCon + Center + auxiliary finance loss.
+    """Compute combined Focal/CE + SupCon + RankIC + auxiliary finance loss.
 
-    v4 Loss formula:
+    v5 Loss formula:
         total = α × Focal(label_smoothing)     # Classification (hard example focus)
               + β × SupCon(temp=0.10)           # Push classes apart
               + γ × CenterLoss                  # Pull each class to its centroid
-              + (1-α-β-γ) × SharpeLoss          # Financial awareness
+              + δ × RankIC                      # Directly optimize IC (NEW)
+              + (1-α-β-γ-δ) × SharpeLoss       # Financial awareness
 
     Args:
         logits: (batch, 3)
         labels: (batch,) — class indices {0, 1, 2}
         forward_returns: (batch,) — actual forward returns
         class_weights: Optional class weights
-        alpha: Classification loss weight (annealed 1.0 → 0.5)
+        alpha: Classification loss weight (annealed)
         auxiliary_loss_fn: SharpeLoss or LogMDDLoss instance
         contrastive_loss_fn: Optional SupConLoss instance
         center_loss_fn: Optional CenterLoss instance
+        rank_ic_loss_fn: Optional RankICLoss instance
         latent: Optional (batch, latent_dim) for contrastive/center loss
         contrastive_weight: β — SupCon weight
         center_loss_weight: γ — Center Loss weight
+        rank_ic_weight: δ — RankIC weight (directly optimizes IC)
         label_smoothing: Label smoothing factor
         focal_gamma: Focal Loss gamma (0.0 = standard CE)
 
@@ -107,15 +112,22 @@ def compute_combined_loss(
     if center_loss_fn is not None and latent is not None and center_loss_weight > 0:
         cen_loss = center_loss_fn(latent, labels)
 
-    # Combined: α*Focal + β*SupCon + γ*Center + (1-α-β-γ)*Aux
+    # RankIC loss — directly maximize IC
+    ric_loss = torch.tensor(0.0, device=logits.device)
+    if rank_ic_loss_fn is not None and rank_ic_weight > 0:
+        ric_loss = rank_ic_loss_fn(logits, forward_returns)
+
+    # Combined: α*Focal + β*SupCon + γ*Center + δ*RankIC + (1-α-β-γ-δ)*Aux
     beta = contrastive_weight
     gamma = center_loss_weight
-    aux_weight = max(0.0, 1.0 - alpha - beta - gamma)
+    delta = rank_ic_weight
+    aux_weight = max(0.0, 1.0 - alpha - beta - gamma - delta)
 
     total = (
         alpha * cls_loss
         + beta * con_loss
         + gamma * cen_loss
+        + delta * ric_loss
         + aux_weight * aux_loss
     )
 
@@ -124,10 +136,12 @@ def compute_combined_loss(
         "aux_loss": aux_loss.item(),
         "con_loss": con_loss.item(),
         "cen_loss": cen_loss.item(),
+        "ric_loss": ric_loss.item(),
         "total_loss": total.item(),
         "alpha": alpha,
         "beta": beta,
         "gamma": gamma,
+        "delta": delta,
     }
 
     return total, components
