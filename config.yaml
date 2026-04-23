@@ -130,15 +130,15 @@ training:
   loss:
     primary: "cross_entropy"
     auxiliary: "sharpe"
-    alpha_start: 0.6
-    alpha_end: 0.25
+    alpha_start: 0.7
+    alpha_end: 0.3
     alpha_anneal_epochs: 30
     label_smoothing: 0.1
     contrastive_weight: 0.10
     contrastive_temp: 0.10
-    focal_gamma: 2.0
+    focal_gamma: 1.0
     center_loss_weight: 0.0
-    rank_ic_weight: 0.25
+    rank_ic_weight: 0.20
 
   class_weights: "inverse_frequency"
 
