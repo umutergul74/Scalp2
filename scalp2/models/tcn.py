@@ -215,15 +215,19 @@ class TCNEncoder(nn.Module):
         self.network = nn.Sequential(*layers)
         self.output_dim = num_channels[-1]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, features) — time-major input
+            return_sequence: If True, return full temporal sequence instead of last timestep.
         Returns:
-            (batch, output_dim) — last timestep representation
+            If return_sequence: (batch, seq_len, output_dim) — full sequence
+            Else: (batch, output_dim) — last timestep representation
         """
         # Conv1d expects (batch, channels, seq_len)
         x = x.transpose(1, 2)
         out = self.network(x)
+        if return_sequence:
+            return out.transpose(1, 2)  # (B, T, C)
         # Take the last timestep
         return out[:, :, -1]

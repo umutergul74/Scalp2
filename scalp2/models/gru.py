@@ -83,16 +83,21 @@ class GRUEncoder(nn.Module):
         if self.use_attention:
             self.attention = TemporalAttention(self.output_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_sequence: bool = False) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, features)
+            return_sequence: If True, return full temporal sequence.
         Returns:
-            (batch, hidden_size * num_directions)
+            If return_sequence: (batch, seq_len, hidden_size * num_directions)
+            Else: (batch, hidden_size * num_directions)
         """
         # output: (batch, seq_len, hidden * directions)
         # h_n: (num_layers * directions, batch, hidden)
         output, h_n = self.gru(x)
+
+        if return_sequence:
+            return output  # (B, T, H)
 
         if self.use_attention:
             return self.attention(output)

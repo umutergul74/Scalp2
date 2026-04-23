@@ -81,6 +81,10 @@ model:
     latent_dim: 96
     bottleneck_dim: 48
     dropout: 0.4
+    use_attention: true
+    n_heads: 4
+    n_attn_layers: 2
+    attn_dropout: 0.1
 
   xgboost:
     objective: "multi:softprob"

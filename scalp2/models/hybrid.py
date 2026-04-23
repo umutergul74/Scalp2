@@ -1,4 +1,15 @@
-"""Hybrid TCN+GRU encoder — v4 with L2 normalization and cosine classifier."""
+"""Hybrid TCN+GRU encoder — v5 with Temporal Fusion Attention.
+
+Major upgrade from v4: instead of independently pooling TCN and GRU outputs
+then concatenating, we keep full temporal sequences from both encoders,
+concatenate at each timestep, and apply Multi-Head Self-Attention to learn
+cross-encoder temporal interactions before pooling.
+
+This allows the model to learn:
+- Which TCN patterns align with which GRU states
+- Which specific timesteps carry the most predictive signal
+- Complex temporal dependencies across both encoder streams
+"""
 
 from __future__ import annotations
 
@@ -7,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from scalp2.config import ModelConfig
+from scalp2.models.attention import TemporalFusionAttention
 from scalp2.models.gru import GRUEncoder
 from scalp2.models.tcn import TCNEncoder
 
@@ -17,11 +29,6 @@ class CosineClassifier(nn.Module):
     Unlike nn.Linear which learns arbitrary weight directions, this classifier
     normalizes both the weight vectors (class prototypes) and the input features.
     The output is `scale * cos(angle between input and class prototype)`.
-
-    This forces the latent space to organize ANGULARLY = directly creates
-    the cluster separation we see in t-SNE.
-
-    Used in face recognition (ArcFace, CosFace) where it's state-of-the-art.
 
     Args:
         in_features: Dimensionality of input features.
@@ -42,39 +49,36 @@ class CosineClassifier(nn.Module):
         Returns:
             (batch, num_classes) — scaled cosine similarities.
         """
-        # Normalize weight vectors (class prototypes)
         w = F.normalize(self.weight, dim=1)
-        # Normalize input (should already be normalized, but safety)
         x = F.normalize(x, dim=1)
-        # Cosine similarity = dot product of normalized vectors
         return self.scale * F.linear(x, w)
 
 
 class HybridEncoder(nn.Module):
-    """Two-stage hybrid architecture: TCN + GRU → bottleneck → L2 norm → cosine classifier.
+    """Two-stage hybrid architecture with Temporal Fusion Attention.
 
-    v4 Architecture:
+    v5 Architecture:
         Input (B, seq_len, n_features)
-            ├─→ TCNEncoder + SE + SpatialDrop + StochDepth → (B, 64)
-            └─→ GRUEncoder + Attention Pooling → (B, 128)
+            ├─→ TCNEncoder  → (B, seq_len, 128)  [full sequence]
+            └─→ GRUEncoder  → (B, seq_len, 192)  [full sequence]
                         ↓
-            Concatenate → (B, 192)
+            Concatenate at each timestep → (B, seq_len, 320)
                         ↓
-            Bottleneck: Linear(192, 32) → LN → GELU → Drop(0.4)  [compress]
-            Expand:     Linear(32, 64)  → LN → GELU → Drop(0.4)  [expand]
-            L2 Normalize → unit hypersphere                        [NEW]
-                        ↓ latent (B, 64) — for XGBoost meta-learner
-            CosineClassifier(64, 3, scale=16) → (B, 3) logits     [NEW]
+            TemporalFusionAttention:
+                2× [MultiHeadSelfAttention(4 heads) + FFN]
+                → LearnedPooling → (B, 320)
+                        ↓
+            Bottleneck: Linear(320, 48) → LN → GELU → Drop(0.4)
+            Expand:     Linear(48, 96)  → LN → GELU → Drop(0.4)
+            L2 Normalize → unit hypersphere
+                        ↓ latent (B, 96)
+            CosineClassifier(96, 3, scale=16) → (B, 3) logits
 
-    Key improvements over v2:
-        - L2 normalization: all latent vectors on unit sphere → 
-          distances become cosine similarity → t-SNE works dramatically better
-        - Cosine classifier: forces angular class separation →
-          classes MUST occupy different directions = cluster separation
-        - Smaller latent (64 vs 128): less curse of dimensionality,
-          cleaner XGBoost features, better t-SNE visualization
-
-    Total parameters: ~290K (smaller than v2's 420K).
+    Key improvements over v4:
+        - Temporal Fusion Attention: joint attention over TCN+GRU sequences
+          instead of naive concat of independently pooled vectors
+        - Richer cross-encoder interactions at every timestep
+        - Learned importance-weighted pooling replaces fixed last-timestep/attn-pool
     """
 
     def __init__(self, n_features: int, config: ModelConfig):
@@ -103,21 +107,39 @@ class HybridEncoder(nn.Module):
         bottleneck_dim = config.fusion.bottleneck_dim
         latent_dim = config.fusion.latent_dim
 
+        # Check if attention fusion is enabled (default: True for v5)
+        use_attn_fusion = getattr(config.fusion, 'use_attention', True)
+
+        if use_attn_fusion:
+            # v5: Temporal Fusion Attention
+            n_heads = getattr(config.fusion, 'n_heads', 4)
+            n_attn_layers = getattr(config.fusion, 'n_attn_layers', 2)
+            attn_dropout = getattr(config.fusion, 'attn_dropout', 0.1)
+            self.fusion_attention = TemporalFusionAttention(
+                d_model=fusion_input_dim,
+                n_heads=n_heads,
+                n_layers=n_attn_layers,
+                dropout=attn_dropout,
+            )
+            self._use_attn_fusion = True
+        else:
+            # v4 fallback: simple concat of pooled vectors
+            self.fusion_attention = None
+            self._use_attn_fusion = False
+
         # Information Bottleneck: compress → expand
         self.projection = nn.Sequential(
-            # Compress: force noise removal (192 → 32)
             nn.Linear(fusion_input_dim, bottleneck_dim),
             nn.LayerNorm(bottleneck_dim),
             nn.GELU(),
             nn.Dropout(config.fusion.dropout),
-            # Expand: reconstruct meaningful representation (32 → 64)
             nn.Linear(bottleneck_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.GELU(),
             nn.Dropout(config.fusion.dropout),
         )
 
-        # Cosine classifier instead of Linear — forces angular separation
+        # Cosine classifier
         self.classifier = CosineClassifier(latent_dim, 3, scale=16.0)
         self.latent_dim = latent_dim
 
@@ -133,31 +155,27 @@ class HybridEncoder(nn.Module):
             logits: (batch, 3) — scaled cosine similarities
             latent: (batch, latent_dim) — L2-normalized, on unit hypersphere
         """
-        tcn_out = self.tcn(x)  # (B, 64)
-        gru_out = self.gru(x)  # (B, 128)
+        if self._use_attn_fusion:
+            # v5: get full sequences, fuse with attention
+            tcn_seq = self.tcn(x, return_sequence=True)  # (B, T, tcn_dim)
+            gru_seq = self.gru(x, return_sequence=True)  # (B, T, gru_dim)
+            fused_seq = torch.cat([tcn_seq, gru_seq], dim=2)  # (B, T, total_dim)
+            merged = self.fusion_attention(fused_seq)  # (B, total_dim)
+        else:
+            # v4 fallback: independent pooling + concat
+            tcn_out = self.tcn(x)  # (B, tcn_dim)
+            gru_out = self.gru(x)  # (B, gru_dim)
+            merged = torch.cat([tcn_out, gru_out], dim=1)  # (B, total_dim)
 
-        merged = torch.cat([tcn_out, gru_out], dim=1)  # (B, 192)
-        raw_latent = self.projection(merged)  # (B, 64)
-
-        # L2 normalize — constrains to unit hypersphere
-        # This makes cosine similarity = dot product
-        # Directly improves t-SNE visualization quality
-        latent = F.normalize(raw_latent, dim=1)  # (B, 64) on unit sphere
-
+        raw_latent = self.projection(merged)  # (B, latent_dim)
+        latent = F.normalize(raw_latent, dim=1)  # (B, latent_dim) on unit sphere
         logits = self.classifier(latent)  # (B, 3)
 
         return logits, latent
 
     @torch.no_grad()
     def extract_latent(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract latent vectors for the XGBoost meta-learner.
-
-        Args:
-            x: (batch, seq_len, n_features)
-
-        Returns:
-            (batch, latent_dim) — L2-normalized, detached
-        """
+        """Extract latent vectors for the XGBoost meta-learner."""
         self.eval()
         _, latent = self.forward(x)
         return latent
