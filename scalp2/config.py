@@ -136,6 +136,10 @@ class FusionConfig:
     latent_dim: int = 64
     bottleneck_dim: int = 32
     dropout: float = 0.4
+    use_attention: bool = False
+    n_heads: int = 4
+    n_attn_layers: int = 2
+    attn_dropout: float = 0.1
 
 
 @dataclass
