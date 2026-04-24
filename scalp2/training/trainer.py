@@ -218,10 +218,12 @@ class Stage1Trainer:
         train_loader = create_dataloaders(
             train_features, train_labels, train_returns,
             seq_len=seq_len, batch_size=self.config.batch_size,
+            augment_train=True,
         )
         val_loader = create_dataloaders(
             val_features, val_labels, val_returns,
             seq_len=seq_len, batch_size=self.config.batch_size,
+            augment_train=False,
         )
 
         class_weights = self._compute_class_weights(train_labels)
