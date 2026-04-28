@@ -86,19 +86,19 @@ model:
   xgboost:
     objective: "multi:softprob"
     num_class: 3
-    max_depth: 5
-    n_estimators: 500
-    learning_rate: 0.05
+    max_depth: 7
+    n_estimators: 800
+    learning_rate: 0.02
     subsample: 0.8
     colsample_bytree: 0.7
-    min_child_weight: 50
-    gamma: 0.1
-    reg_alpha: 0.1
+    min_child_weight: 5
+    gamma: 0.05
+    reg_alpha: 0.05
     reg_lambda: 1.0
     tree_method: "hist"
     device: "cuda"
     eval_metric: "mlogloss"
-    early_stopping_rounds: 30
+    early_stopping_rounds: 50
 
   bypass_xgboost: true    # Use raw TCN+GRU logits instead of XGBoost meta-learner
   handcrafted_top_k: 40
