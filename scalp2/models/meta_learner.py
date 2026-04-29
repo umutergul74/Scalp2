@@ -69,6 +69,36 @@ class XGBoostMetaLearner:
         """
         return np.hstack([latent, handcrafted, regime_probs]).astype(np.float32)
 
+    @staticmethod
+    def compute_sample_weights(labels: np.ndarray) -> np.ndarray:
+        """Compute inverse-frequency sample weights to combat class imbalance.
+
+        Without this, XGBoost's mlogloss objective will predict the majority
+        class (Hold) for nearly everything, destroying directional signals.
+
+        Args:
+            labels: (n,) array of class labels {0, 1, 2}.
+
+        Returns:
+            (n,) array of per-sample weights.
+        """
+        classes, counts = np.unique(labels, return_counts=True)
+        n_samples = len(labels)
+        n_classes = len(classes)
+
+        # Weight = n_samples / (n_classes * count_per_class)
+        class_weights = n_samples / (n_classes * counts)
+
+        # Map per-class weights to per-sample weights
+        weight_map = dict(zip(classes, class_weights))
+        sample_weights = np.array([weight_map[label] for label in labels], dtype=np.float32)
+
+        logger.info(
+            "Class weights: %s",
+            {int(c): f"{w:.3f}" for c, w in zip(classes, class_weights)},
+        )
+        return sample_weights
+
     def fit(
         self,
         X_train: np.ndarray,
@@ -76,6 +106,7 @@ class XGBoostMetaLearner:
         X_val: np.ndarray,
         y_val: np.ndarray,
         feature_names: list[str] | None = None,
+        use_sample_weights: bool = True,
     ) -> XGBoostMetaLearner:
         """Fit XGBoost with early stopping on validation set.
 
@@ -85,11 +116,17 @@ class XGBoostMetaLearner:
             X_val: Validation features.
             y_val: Validation labels.
             feature_names: Optional feature name list for interpretability.
+            use_sample_weights: If True, apply inverse-frequency class weights.
 
         Returns:
             self (for chaining).
         """
         self.feature_names = feature_names
+
+        # Compute sample weights to rebalance classes
+        sample_weight = None
+        if use_sample_weights:
+            sample_weight = self.compute_sample_weights(y_train)
 
         logger.info(
             "Training XGBoost meta-learner: %d train, %d val, %d features",
@@ -99,6 +136,7 @@ class XGBoostMetaLearner:
         self.model.fit(
             X_train,
             y_train,
+            sample_weight=sample_weight,
             eval_set=[(X_val, y_val)],
             verbose=False,
         )
