@@ -91,26 +91,37 @@ def align_mtf_features(
 
 
 def build_mtf_dataset(
-    df_15m: pd.DataFrame,
-    df_1h: pd.DataFrame,
-    df_4h: pd.DataFrame,
+    df_primary: pd.DataFrame,
+    *htf_dfs: pd.DataFrame,
+    htf_labels: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Build a unified dataset with 15m base + 1H/4H context features.
+    """Build a unified dataset with primary base + higher-timeframe context features.
 
-    All HTF indicator columns in df_1h and df_4h (everything except OHLCV)
-    are aligned to the 15m index using backward merge to avoid look-ahead.
+    All HTF indicator columns (everything except OHLCV) are aligned to the
+    primary index using backward merge to avoid look-ahead.
 
     Args:
-        df_15m: 15-minute DataFrame with features already computed.
-        df_1h: 1-hour DataFrame with features already computed.
-        df_4h: 4-hour DataFrame with features already computed.
+        df_primary: Primary timeframe DataFrame with features already computed.
+        *htf_dfs: One or more higher-timeframe DataFrames with features.
+        htf_labels: Labels for each HTF (e.g. ["4h"]). If None, auto-detected
+            from the DataFrame index frequency.
 
     Returns:
-        Unified DataFrame on 15m index with all features.
+        Unified DataFrame on primary index with all features.
     """
-    result = df_15m.copy()
-    result = align_mtf_features(result, df_1h, htf_label="1h")
-    result = align_mtf_features(result, df_4h, htf_label="4h")
+    # Auto-detect HTF labels if not provided
+    if htf_labels is None:
+        default_labels = ["1h", "4h", "1d"]
+        htf_labels = default_labels[:len(htf_dfs)]
+
+    if len(htf_labels) != len(htf_dfs):
+        raise ValueError(
+            f"Got {len(htf_dfs)} HTF DataFrames but {len(htf_labels)} labels"
+        )
+
+    result = df_primary.copy()
+    for htf_df, label in zip(htf_dfs, htf_labels):
+        result = align_mtf_features(result, htf_df, htf_label=label)
 
     # Forward-fill any NaNs introduced at the start (HTF warmup)
     n_nan_before = result.isna().sum().sum()

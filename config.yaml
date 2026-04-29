@@ -1,16 +1,16 @@
 # ============================================================
-# Scalp2 Configuration — BTC/USDT HFT Scalping Framework
+# Scalp2 Configuration — BTC/USDT Swing Trading Framework (1H)
 # ============================================================
 
 data:
   symbol: "BTC/USDT"
   exchange: "binanceusdm"
   timeframes:
-    primary: "15m"
-    mtf: ["1h", "4h"]
+    primary: "1h"
+    mtf: ["4h"]
   date_range:
     start: "2020-01-01"
-    end: "2026-03-19"
+    end: "2026-04-29"
   cache_dir: "./data/raw"
   processed_dir: "./data/processed"
 
@@ -56,11 +56,11 @@ labeling:
   tp_multiplier: 2.0
   sl_multiplier: 1.2
   max_holding_bars: 10
-  min_return_threshold: 0.0005
+  min_return_threshold: 0.001
   atr_period: 14
 
 model:
-  seq_len: 128
+  seq_len: 64
 
   tcn:
     num_channels: [64, 128, 128, 128, 128]
@@ -144,12 +144,12 @@ training:
   class_weights: "inverse_frequency"
 
   walk_forward:
-    train_bars: 20160
-    val_bars: 4320
-    test_bars: 2880
-    purge_bars: 48
-    embargo_bars: 12
-    step_bars: 2880
+    train_bars: 5040
+    val_bars: 1080
+    test_bars: 720
+    purge_bars: 12
+    embargo_bars: 3
+    step_bars: 720
 
   scaler: "robust"
 
@@ -162,8 +162,8 @@ regime:
   choppy_threshold: 0.85
   online_update_enabled: true
   online_decay_factor: 0.995
-  online_update_interval: 48
-  online_min_samples: 96
+  online_update_interval: 12
+  online_min_samples: 24
 
 execution:
   time_of_day_filter:
