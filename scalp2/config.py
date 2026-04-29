@@ -146,19 +146,19 @@ class FusionConfig:
 class XGBoostConfig:
     objective: str = "multi:softprob"
     num_class: int = 3
-    max_depth: int = 5
-    n_estimators: int = 500
-    learning_rate: float = 0.05
+    max_depth: int = 7
+    n_estimators: int = 800
+    learning_rate: float = 0.02
     subsample: float = 0.8
     colsample_bytree: float = 0.7
-    min_child_weight: int = 50
-    gamma: float = 0.1
-    reg_alpha: float = 0.1
+    min_child_weight: int = 5
+    gamma: float = 0.05
+    reg_alpha: float = 0.05
     reg_lambda: float = 1.0
     tree_method: str = "hist"
     device: str = "cuda"
     eval_metric: str = "mlogloss"
-    early_stopping_rounds: int = 30
+    early_stopping_rounds: int = 50
 
 
 @dataclass

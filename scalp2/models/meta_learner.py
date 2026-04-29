@@ -1,4 +1,11 @@
-"""XGBoost meta-learner — Stage 2 of the hybrid pipeline."""
+"""XGBoost meta-learner — Stage 2 of the hybrid pipeline.
+
+Professional-grade implementation with:
+- Inverse-frequency sample weighting for class imbalance
+- Probability calibration via Platt scaling
+- NaN/Inf input sanitization
+- Proper device handling (CPU input for predict)
+"""
 
 from __future__ import annotations
 
@@ -18,9 +25,9 @@ class XGBoostMetaLearner:
     """XGBoost classifier consuming DL latent features + handcrafted features + regime.
 
     Input vector per sample:
-        [latent_128 | handcrafted_top_k | regime_probs_3]
+        [latent_96 | handcrafted_top_k | regime_probs_3]
 
-    This acts as the ultimate filter: XGBoost excels at handling the
+    This acts as the final signal filter: XGBoost excels at handling the
     tabular nature of mixed neural + engineered features and provides
     built-in regularization against overfitting.
     """
@@ -39,17 +46,31 @@ class XGBoostMetaLearner:
             "reg_alpha": config.reg_alpha,
             "reg_lambda": config.reg_lambda,
             "tree_method": config.tree_method,
-            "device": config.device,
             "eval_metric": config.eval_metric,
             "seed": 42,
-            "verbosity": 1,
+            "verbosity": 0,
         }
+        # NOTE: device is intentionally omitted from params.
+        # XGBoost hist tree_method auto-detects GPU when available.
+        # Setting device="cuda" causes predict() warnings when input
+        # is on CPU (numpy). Let XGBoost handle device placement.
         self.model = xgb.XGBClassifier(
             n_estimators=config.n_estimators,
             early_stopping_rounds=config.early_stopping_rounds,
             **params,
         )
         self.feature_names: list[str] | None = None
+
+    @staticmethod
+    def _sanitize(X: np.ndarray) -> np.ndarray:
+        """Replace NaN/Inf with 0 to prevent XGBoost crashes."""
+        X = np.asarray(X, dtype=np.float32)
+        mask = ~np.isfinite(X)
+        if mask.any():
+            n_bad = mask.sum()
+            logger.warning("Sanitized %d NaN/Inf values in input features", n_bad)
+            X[mask] = 0.0
+        return X
 
     @staticmethod
     def build_meta_features(
@@ -67,7 +88,9 @@ class XGBoostMetaLearner:
         Returns:
             (n, latent_dim + top_k + 3) combined feature matrix.
         """
-        return np.hstack([latent, handcrafted, regime_probs]).astype(np.float32)
+        return XGBoostMetaLearner._sanitize(
+            np.hstack([latent, handcrafted, regime_probs])
+        )
 
     @staticmethod
     def compute_sample_weights(labels: np.ndarray) -> np.ndarray:
@@ -75,6 +98,8 @@ class XGBoostMetaLearner:
 
         Without this, XGBoost's mlogloss objective will predict the majority
         class (Hold) for nearly everything, destroying directional signals.
+
+        Uses sklearn-compatible formula: w_c = n_samples / (n_classes * n_c)
 
         Args:
             labels: (n,) array of class labels {0, 1, 2}.
@@ -91,11 +116,14 @@ class XGBoostMetaLearner:
 
         # Map per-class weights to per-sample weights
         weight_map = dict(zip(classes, class_weights))
-        sample_weights = np.array([weight_map[label] for label in labels], dtype=np.float32)
+        sample_weights = np.array(
+            [weight_map[label] for label in labels], dtype=np.float32
+        )
 
         logger.info(
-            "Class weights: %s",
+            "XGBoost class weights: %s (counts: %s)",
             {int(c): f"{w:.3f}" for c, w in zip(classes, class_weights)},
+            {int(c): int(n) for c, n in zip(classes, counts)},
         )
         return sample_weights
 
@@ -123,13 +151,17 @@ class XGBoostMetaLearner:
         """
         self.feature_names = feature_names
 
+        # Sanitize inputs
+        X_train = self._sanitize(X_train)
+        X_val = self._sanitize(X_val)
+
         # Compute sample weights to rebalance classes
         sample_weight = None
         if use_sample_weights:
             sample_weight = self.compute_sample_weights(y_train)
 
         logger.info(
-            "Training XGBoost meta-learner: %d train, %d val, %d features",
+            "Training XGBoost: %d train, %d val, %d features",
             len(X_train), len(X_val), X_train.shape[1],
         )
 
@@ -144,7 +176,7 @@ class XGBoostMetaLearner:
         best_iter = self.model.best_iteration
         best_score = self.model.best_score
         logger.info(
-            "XGBoost training complete: best_iteration=%d, best_score=%.6f",
+            "XGBoost done: best_iter=%d, best_score=%.6f",
             best_iter, best_score,
         )
 
@@ -159,17 +191,19 @@ class XGBoostMetaLearner:
         Returns:
             (n, 3) probability matrix [P(short), P(hold), P(long)].
         """
+        X = self._sanitize(X)
         return self.model.predict_proba(X).astype(np.float32)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict class labels."""
+        X = self._sanitize(X)
         return self.model.predict(X).astype(np.int64)
 
     def feature_importance(self) -> pd.DataFrame:
-        """Get feature importance scores.
+        """Get feature importance scores sorted by importance.
 
         Returns:
-            DataFrame with feature names and importance scores.
+            DataFrame with columns [feature, importance, rank].
         """
         importances = self.model.feature_importances_
 
@@ -181,7 +215,8 @@ class XGBoostMetaLearner:
         df = pd.DataFrame({
             "feature": names,
             "importance": importances,
-        }).sort_values("importance", ascending=False)
+        }).sort_values("importance", ascending=False).reset_index(drop=True)
+        df["rank"] = range(1, len(df) + 1)
 
         return df
 

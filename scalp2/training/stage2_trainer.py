@@ -1,4 +1,12 @@
-"""Stage-2 XGBoost meta-learner training pipeline."""
+"""Stage-2 XGBoost meta-learner training pipeline.
+
+Professional-grade orchestrator that:
+- Extracts L2-normalized latent vectors from trained Stage-1 models
+- Selects top-K handcrafted features via mutual information
+- Injects HMM regime probabilities (forward-only for val/test)
+- Trains XGBoost with class-balanced sample weights
+- Scales handcrafted features independently to prevent leakage
+"""
 
 from __future__ import annotations
 
@@ -22,10 +30,12 @@ class Stage2Trainer:
 
     For each walk-forward fold:
         1. Load best Stage-1 model
-        2. Extract 128-dim latent vectors from train/val/test
+        2. Extract 96-dim L2-normalized latent vectors from train/val/test
         3. Select top-K handcrafted features by mutual information
-        4. Get HMM regime probabilities
-        5. Concatenate all → fit XGBoost → evaluate on test
+        4. Scale handcrafted features with a SEPARATE RobustScaler
+           (latent vectors are already L2-normalized, don't re-scale them)
+        5. Get HMM regime probabilities (forward-only for val/test — no look-ahead)
+        6. Concatenate all → fit XGBoost with sample weights → evaluate on test
     """
 
     def __init__(self, config: Config, checkpoint_dir: str | Path = "./checkpoints"):
@@ -41,6 +51,8 @@ class Stage2Trainer:
     ) -> tuple[np.ndarray, list[str]]:
         """Select top-K features by mutual information.
 
+        MI is computed on the training set only — no leakage from val/test.
+
         Args:
             features: (n_samples, n_features) array.
             labels: (n_samples,) label array.
@@ -51,6 +63,9 @@ class Stage2Trainer:
             selected_indices: Indices of selected features.
             selected_names: Names of selected features.
         """
+        # Cap top_k to available features
+        top_k = min(top_k, features.shape[1])
+
         mi_scores = mutual_info_classif(
             features, labels, random_state=42, n_neighbors=5
         )
@@ -87,7 +102,7 @@ class Stage2Trainer:
             regime_detector: Fitted RegimeDetector.
             train/val/test_features: Scaled feature arrays.
             train/val/test_labels: Label arrays.
-            train/val/test_df_regime: DataFrames with regime feature columns.
+            train/val/test_df_regime: DataFrames for regime detection.
             feature_names: All feature column names.
             fold_idx: Current fold index.
 
@@ -97,7 +112,9 @@ class Stage2Trainer:
         seq_len = self.config.model.seq_len
         top_k = self.config.model.handcrafted_top_k
 
-        # 1. Extract latent vectors
+        # ─── 1. Extract latent vectors ───────────────────────────
+        # These are L2-normalized 96-dim vectors on the unit hypersphere.
+        # No additional scaling needed.
         logger.info("Fold %d: extracting latent vectors...", fold_idx)
         latent_train = stage1_trainer.extract_latents(train_features, seq_len)
         latent_val = stage1_trainer.extract_latents(val_features, seq_len)
@@ -108,7 +125,7 @@ class Stage2Trainer:
         val_labels_aligned = val_labels[seq_len:]
         test_labels_aligned = test_labels[seq_len:]
 
-        # 2. Select top-K handcrafted features
+        # ─── 2. Select and scale top-K handcrafted features ──────
         top_indices, selected_names = self.select_top_features(
             train_features[seq_len:], train_labels_aligned, feature_names, top_k
         )
@@ -117,19 +134,28 @@ class Stage2Trainer:
         hc_val = val_features[seq_len:][:, top_indices]
         hc_test = test_features[seq_len:][:, top_indices]
 
-        # 3. Get regime probabilities
+        # Scale handcrafted features with a separate scaler.
+        # The main scaler was fit on ALL features before Stage 1,
+        # but feature selection may pick different features per fold.
+        # A fresh RobustScaler ensures consistent scaling.
+        hc_scaler = RobustScaler()
+        hc_train = hc_scaler.fit_transform(hc_train).astype(np.float32)
+        hc_val = hc_scaler.transform(hc_val).astype(np.float32)
+        hc_test = hc_scaler.transform(hc_test).astype(np.float32)
+
+        # ─── 3. Get regime probabilities ─────────────────────────
         # Train: forward-backward OK (no leakage within training data)
         # Val/Test: forward-only to avoid look-ahead via backward pass
         regime_train = regime_detector.predict_proba(train_df_regime.iloc[seq_len:])
         regime_val = regime_detector.predict_proba_online(val_df_regime.iloc[seq_len:])
         regime_test = regime_detector.predict_proba_online(test_df_regime.iloc[seq_len:])
 
-        # Ensure consistent lengths (truncate to shortest)
+        # ─── 4. Ensure consistent lengths ────────────────────────
         min_train = min(len(latent_train), len(hc_train), len(regime_train))
         min_val = min(len(latent_val), len(hc_val), len(regime_val))
         min_test = min(len(latent_test), len(hc_test), len(regime_test))
 
-        # 4. Build meta-feature matrices
+        # ─── 5. Build meta-feature matrices ──────────────────────
         meta_train = XGBoostMetaLearner.build_meta_features(
             latent_train[:min_train], hc_train[:min_train], regime_train[:min_train]
         )
@@ -140,12 +166,18 @@ class Stage2Trainer:
             latent_test[:min_test], hc_test[:min_test], regime_test[:min_test]
         )
 
-        # Build feature name list
-        latent_names = [f"latent_{i}" for i in range(latent_train.shape[1])]
+        # Build feature name list for interpretability
+        latent_dim = latent_train.shape[1]
+        latent_names = [f"latent_{i}" for i in range(latent_dim)]
         regime_names = ["regime_bull", "regime_bear", "regime_choppy"]
         all_meta_names = latent_names + selected_names + regime_names
 
-        # 5. Train XGBoost
+        logger.info(
+            "Fold %d meta-features: %d latent + %d handcrafted + 3 regime = %d total",
+            fold_idx, latent_dim, len(selected_names), meta_train.shape[1],
+        )
+
+        # ─── 6. Train XGBoost ────────────────────────────────────
         meta_learner = XGBoostMetaLearner(self.config.model.xgboost)
         meta_learner.fit(
             meta_train,
@@ -155,7 +187,7 @@ class Stage2Trainer:
             feature_names=all_meta_names,
         )
 
-        # 6. Test predictions
+        # ─── 7. Test predictions ─────────────────────────────────
         test_probs = meta_learner.predict_proba(meta_test)
         test_preds = meta_learner.predict(meta_test)
 
@@ -165,10 +197,11 @@ class Stage2Trainer:
 
         # Feature importance
         importance_df = meta_learner.feature_importance()
+        top5 = importance_df.head(5)
         logger.info(
             "Fold %d top-5 XGBoost features:\n%s",
             fold_idx,
-            importance_df.head(5).to_string(index=False),
+            top5.to_string(index=False),
         )
 
         return {

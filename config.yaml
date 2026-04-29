@@ -96,7 +96,7 @@ model:
     reg_alpha: 0.05
     reg_lambda: 1.0
     tree_method: "hist"
-    device: "cuda"
+    device: "cpu"
     eval_metric: "mlogloss"
     early_stopping_rounds: 50
 
