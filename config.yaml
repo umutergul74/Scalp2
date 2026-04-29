@@ -170,8 +170,8 @@ execution:
     enabled: false
     blocked_hours_utc: [3, 4]
 
-  confidence_threshold: 0.35
-  max_trades_per_day: 12
+  confidence_threshold: 0.55
+  max_trades_per_day: 4
   min_adx: 10
   min_atr_percentile: 0.02
   choppy_adx_override: 22
@@ -185,18 +185,18 @@ execution:
 
   position_sizing:
     method: "fractional_kelly"
-    max_fraction: 0.20
-    kelly_fraction: 0.60
-    leverage: 20
+    max_fraction: 0.15
+    kelly_fraction: 0.50
+    leverage: 5
     maintenance_margin: 0.005
 
   trade_management:
-    partial_tp_1_atr: 0.8
-    partial_tp_1_pct: 0.5
-    full_tp_atr: 2.0
-    breakeven_trigger_atr: 0.8
-    trailing_activation_atr: 1.2
-    trailing_distance_atr: 0.6
+    partial_tp_1_atr: 1.2
+    partial_tp_1_pct: 0.4
+    full_tp_atr: 2.5
+    breakeven_trigger_atr: 1.0
+    trailing_activation_atr: 1.5
+    trailing_distance_atr: 0.5
     structural_exit:
       enabled: true
       fvg_proximity_atr: 0.3
