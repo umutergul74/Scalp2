@@ -159,7 +159,7 @@ regime:
   features: ["log_return", "gk_vol_14", "adx", "cvd_delta_zscore", "vwap_dist_atr"]
   covariance_type: "full"
   n_iter: 100
-  choppy_threshold: 0.85
+  choppy_threshold: 0.50
   online_update_enabled: true
   online_decay_factor: 0.995
   online_update_interval: 12
