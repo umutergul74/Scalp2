@@ -178,6 +178,15 @@ execution:
   choppy_adx_override: 22
   regime_direction_filter: false
 
+  pyramiding:
+    enabled: true
+    max_concurrent_tranches: 20
+    max_trades_per_day: 24
+    base_position_size: 0.10
+    high_conf_threshold: 0.55
+    take_profit_pct: 0.015
+    max_hold_bars: 24
+
   order_execution:
     order_type: "limit"
     maker_fee_bps: 2
