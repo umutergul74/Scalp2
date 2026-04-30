@@ -173,7 +173,7 @@ execution:
   confidence_threshold: 0.40
   max_trades_per_day: 8
   direction_filter: "long_only"
-  min_adx: 20
+  min_adx: 25
   min_atr_percentile: 0.10
   choppy_adx_override: 22
   regime_direction_filter: false
@@ -184,7 +184,7 @@ execution:
     max_trades_per_day: 24
     base_position_size: 0.10
     high_conf_threshold: 0.55
-    take_profit_pct: 0.015
+    take_profit_pct: 0.030
     max_hold_bars: 24
 
   order_execution:
