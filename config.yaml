@@ -54,7 +54,7 @@ features:
 labeling:
   method: "triple_barrier"
   tp_multiplier: 2.0
-  sl_multiplier: 1.2
+  sl_multiplier: 5.0
   max_holding_bars: 10
   min_return_threshold: 0.001
   atr_period: 14
@@ -170,13 +170,13 @@ execution:
     enabled: false
     blocked_hours_utc: [3, 4]
 
-  confidence_threshold: 0.50
-  max_trades_per_day: 6
+  confidence_threshold: 0.40
+  max_trades_per_day: 8
   direction_filter: "long_only"
-  min_adx: 10
-  min_atr_percentile: 0.02
+  min_adx: 5
+  min_atr_percentile: 0.01
   choppy_adx_override: 22
-  regime_direction_filter: true
+  regime_direction_filter: false
 
   order_execution:
     order_type: "limit"
@@ -192,14 +192,14 @@ execution:
     maintenance_margin: 0.005
 
   trade_management:
-    partial_tp_1_atr: 1.2
-    partial_tp_1_pct: 0.4
-    full_tp_atr: 2.5
-    breakeven_trigger_atr: 1.0
-    trailing_activation_atr: 1.5
-    trailing_distance_atr: 0.5
+    partial_tp_1_atr: 10.0
+    partial_tp_1_pct: 0.0
+    full_tp_atr: 10.0
+    breakeven_trigger_atr: 10.0
+    trailing_activation_atr: 10.0
+    trailing_distance_atr: 10.0
     structural_exit:
-      enabled: true
+      enabled: false
       fvg_proximity_atr: 0.3
       sweep_buffer_atr: 0.15
       vwap_margin_atr: 0.5
