@@ -222,4 +222,42 @@ def compute_all_technical(df: pd.DataFrame, config: TechnicalConfig) -> pd.DataF
         / (df["volume"].rolling(20, min_periods=20).std() + 1e-10)
     )
 
+    # ── Macro Regime Features ─────────────────────────────────────────────
+
+    # A. Trend Alignment Score — EMA stack alignment across 3 periods
+    #    +1 = perfect bull stack (EMA9 > EMA21 > EMA55)
+    #    -1 = perfect bear stack
+    #     0 = mixed / choppy
+    ema_periods = config.ema_periods  # [9, 21, 55]
+    if len(ema_periods) >= 3:
+        e_fast = result[f"ema_{ema_periods[0]}"]
+        e_mid = result[f"ema_{ema_periods[1]}"]
+        e_slow = result[f"ema_{ema_periods[2]}"]
+        bull_aligned = ((e_fast > e_mid) & (e_mid > e_slow)).astype(np.float32)
+        bear_aligned = ((e_fast < e_mid) & (e_mid < e_slow)).astype(np.float32)
+        result["trend_alignment"] = bull_aligned - bear_aligned
+
+    # B. Momentum Divergence — rolling correlation between price direction
+    #    and RSI direction. Low correlation = trend exhaustion / reversal.
+    price_dir = df["close"].diff(20)
+    rsi_col = f"rsi_{config.rsi_period}"
+    rsi_dir = result[rsi_col].diff(20)
+    result["momentum_divergence"] = (
+        price_dir.rolling(20, min_periods=10).corr(rsi_dir).astype(np.float32)
+    )
+
+    # C. Volatility Regime Ratio — short-term vol / long-term vol.
+    #    > 1 = volatility expanding (danger / opportunity)
+    #    < 1 = volatility contracting (calm market)
+    gk_col = f"gk_vol_{config.atr_period}" if f"gk_vol_{config.atr_period}" in result.columns else None
+    if gk_col is None:
+        # Fallback: use ATR-based vol ratio
+        atr_col = f"atr_{config.atr_period}"
+        short_vol = result[atr_col].rolling(24, min_periods=12).mean()
+        long_vol = result[atr_col].rolling(168, min_periods=48).mean()
+    else:
+        short_vol = result[gk_col].rolling(24, min_periods=12).mean()
+        long_vol = result[gk_col].rolling(168, min_periods=48).mean()
+    result["vol_regime_ratio"] = (short_vol / (long_vol + 1e-10)).astype(np.float32)
+
     return result
