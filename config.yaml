@@ -170,8 +170,9 @@ execution:
     enabled: false
     blocked_hours_utc: [3, 4]
 
-  confidence_threshold: 0.55
-  max_trades_per_day: 4
+  confidence_threshold: 0.50
+  max_trades_per_day: 6
+  direction_filter: "long_only"
   min_adx: 10
   min_atr_percentile: 0.02
   choppy_adx_override: 22

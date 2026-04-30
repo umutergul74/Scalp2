@@ -409,6 +409,7 @@ class ExecutionConfig:
     min_adx: float = 20.0
     min_atr_percentile: float = 0.15
     choppy_adx_override: float = 35.0
+    direction_filter: str = "both"  # "both", "long_only", "short_only"
     regime_direction_filter: bool = True  # block SHORT in bull, LONG in bear
     time_of_day_filter: TimeOfDayFilterConfig = field(
         default_factory=TimeOfDayFilterConfig
