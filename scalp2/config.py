@@ -403,8 +403,6 @@ class RiskLimitsConfig:
 
 
 @dataclass
-
-@dataclass
 class PyramidingConfig:
     enabled: bool = True
     max_concurrent_tranches: int = 20
@@ -414,6 +412,7 @@ class PyramidingConfig:
     take_profit_pct: float = 0.015
     max_hold_bars: int = 24
 
+@dataclass
 class ExecutionConfig:
     confidence_threshold: float = 0.70
     max_trades_per_day: int = 2
