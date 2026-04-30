@@ -30,13 +30,15 @@ class SharpeLoss(nn.Module):
         self.annualization = annualization
 
     def forward(
-        self, logits: torch.Tensor, forward_returns: torch.Tensor
+        self, logits: torch.Tensor, forward_returns: torch.Tensor,
+        rt_cost: float = 0.0,
     ) -> torch.Tensor:
         """Compute negative Sharpe ratio loss.
 
         Args:
             logits: (batch, 3) — raw model outputs [short, hold, long]
             forward_returns: (batch,) — actual forward returns per bar
+            rt_cost: Round-trip cost as decimal (e.g. 0.0008 for 8bps)
 
         Returns:
             Scalar loss (negative Sharpe ratio).
@@ -45,8 +47,9 @@ class SharpeLoss(nn.Module):
         probs = F.softmax(logits, dim=1)
         position = probs[:, 2] - probs[:, 0]  # long - short
 
-        # Portfolio returns
-        portfolio_returns = position * forward_returns
+        # Cost-aware portfolio returns
+        cost_penalty = position.abs() * rt_cost
+        portfolio_returns = position * forward_returns - cost_penalty
 
         # Sharpe ratio
         mean_ret = portfolio_returns.mean()

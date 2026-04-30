@@ -149,6 +149,9 @@ class Stage1Trainer:
         self.rank_ic_weight = getattr(config.loss, 'rank_ic_weight', 0.0)
         self.rank_ic_loss_fn = RankICLoss() if self.rank_ic_weight > 0 else None
 
+        # Cost-aware training: RT cost as decimal
+        self.rt_cost = getattr(config.loss, 'rt_cost_bps', 0.0) / 10_000
+
         # Center loss — initialized per fold in train_one_fold
         self.center_loss_fn = None
 
@@ -317,6 +320,7 @@ class Stage1Trainer:
                     rank_ic_weight=self.rank_ic_weight,
                     label_smoothing=self.label_smoothing,
                     focal_gamma=self.focal_gamma,
+                    rt_cost=self.rt_cost,
                 )
 
             self.scaler.scale(loss).backward()
@@ -363,6 +367,7 @@ class Stage1Trainer:
                     rank_ic_weight=self.rank_ic_weight,
                     label_smoothing=self.label_smoothing,
                     focal_gamma=self.focal_gamma,
+                    rt_cost=self.rt_cost,
                 )
 
             total_loss += loss.item()

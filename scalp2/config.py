@@ -211,6 +211,8 @@ class LossConfig:
     contrastive_temp: float = 0.10
     focal_gamma: float = 2.0
     center_loss_weight: float = 0.05
+    rank_ic_weight: float = 0.0
+    rt_cost_bps: float = 0.0  # Round-trip cost in bps for cost-aware training
 
 
 @dataclass

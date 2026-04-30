@@ -21,20 +21,24 @@ class LogMDDLoss(nn.Module):
         self.eps = eps
 
     def forward(
-        self, logits: torch.Tensor, forward_returns: torch.Tensor
+        self, logits: torch.Tensor, forward_returns: torch.Tensor,
+        rt_cost: float = 0.0,
     ) -> torch.Tensor:
         """Compute log maximum drawdown loss.
 
         Args:
             logits: (batch, 3) — raw model outputs [short, hold, long]
             forward_returns: (batch,) — actual forward returns per bar
+            rt_cost: Round-trip cost as decimal (e.g. 0.0008 for 8bps)
 
         Returns:
             Scalar loss: log(1 + max_drawdown)
         """
         probs = F.softmax(logits, dim=1)
         position = probs[:, 2] - probs[:, 0]
-        portfolio_returns = position * forward_returns
+        # Cost-aware: penalize every unit of position taken
+        cost_penalty = position.abs() * rt_cost
+        portfolio_returns = position * forward_returns - cost_penalty
         cum_returns = torch.cumsum(portfolio_returns, dim=0)
         running_max = torch.cummax(cum_returns, dim=0)[0]
         drawdown = running_max - cum_returns
@@ -58,6 +62,7 @@ def compute_combined_loss(
     rank_ic_weight: float = 0.0,
     label_smoothing: float = 0.0,
     focal_gamma: float = 0.0,
+    rt_cost: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute combined Focal/CE + SupCon + RankIC + auxiliary finance loss.
 
@@ -99,8 +104,8 @@ def compute_combined_loss(
             label_smoothing=label_smoothing,
         )
 
-    # Auxiliary finance loss (Sharpe or LogMDD)
-    aux_loss = auxiliary_loss_fn(logits, forward_returns)
+    # Auxiliary finance loss (Sharpe or LogMDD) — cost-aware
+    aux_loss = auxiliary_loss_fn(logits, forward_returns, rt_cost=rt_cost)
 
     # Contrastive loss on latent space
     con_loss = torch.tensor(0.0, device=logits.device)

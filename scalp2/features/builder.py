@@ -119,6 +119,9 @@ def get_feature_columns(df: pd.DataFrame) -> list[str]:
         # Absolute structural price levels (Smart Exit Engine only, NOT for ML)
         "fvg_bull_price", "fvg_bear_price",
         "swing_high_price", "swing_low_price",
+        
+        # Funding rate — used as execution filter, NOT model input
+        "funding_rate", "funding_rate_ma", "funding_rate_zscore",
     }
     
     # Hard-drop list from Phase 1 Feature Forensics (IC10 < 0.005)

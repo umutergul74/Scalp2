@@ -140,11 +140,12 @@ training:
     focal_gamma: 1.0
     center_loss_weight: 0.0
     rank_ic_weight: 0.20
+    rt_cost_bps: 8.0
 
   class_weights: "inverse_frequency"
 
   walk_forward:
-    train_bars: 5040
+    train_bars: 7560
     val_bars: 1080
     test_bars: 720
     purge_bars: 12
