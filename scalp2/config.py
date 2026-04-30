@@ -403,6 +403,17 @@ class RiskLimitsConfig:
 
 
 @dataclass
+
+@dataclass
+class PyramidingConfig:
+    enabled: bool = True
+    max_concurrent_tranches: int = 20
+    max_trades_per_day: int = 24
+    base_position_size: float = 0.10
+    high_conf_threshold: float = 0.55
+    take_profit_pct: float = 0.015
+    max_hold_bars: int = 24
+
 class ExecutionConfig:
     confidence_threshold: float = 0.70
     max_trades_per_day: int = 2
@@ -423,6 +434,7 @@ class ExecutionConfig:
     trade_management: TradeManagementConfig = field(
         default_factory=TradeManagementConfig
     )
+    pyramiding: PyramidingConfig = field(default_factory=PyramidingConfig)
     risk_limits: RiskLimitsConfig = field(default_factory=RiskLimitsConfig)
     model_refresh: ModelRefreshConfig = field(default_factory=ModelRefreshConfig)
     slippage_model: SlippageModelConfig = field(
