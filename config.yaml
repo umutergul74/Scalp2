@@ -182,7 +182,7 @@ execution:
     enabled: true
     max_concurrent_tranches: 20
     max_trades_per_day: 24
-    base_position_size: 0.10
+    base_position_size: 0.15
     high_conf_threshold: 0.55
     take_profit_pct: 0.020
     max_hold_bars: 24
