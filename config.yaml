@@ -172,7 +172,7 @@ execution:
 
   confidence_threshold: 0.40
   max_trades_per_day: 8
-  direction_filter: "both"
+  direction_filter: "long_only"
   min_adx: 20
   min_atr_percentile: 0.10
   choppy_adx_override: 22
