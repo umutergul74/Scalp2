@@ -206,8 +206,11 @@ class OHLCVDownloader:
         while since < end_ms:
             try:
                 self._throttle()
+                ccxt_symbol = self.config.symbol
+                if self.config.exchange == "binanceusdm" and ":" not in ccxt_symbol:
+                    ccxt_symbol = f"{ccxt_symbol}:{ccxt_symbol.split('/')[1]}"
                 rates = self.exchange.fetch_funding_rate_history(
-                    self.config.symbol, since=since, limit=1000
+                    ccxt_symbol, since=since, limit=1000
                 )
                 self._mark_request()
                 rate_limit_retries = 0
