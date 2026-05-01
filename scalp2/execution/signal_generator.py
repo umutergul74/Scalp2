@@ -200,6 +200,20 @@ class SignalGenerator:
                 return self._no_trade(current_price, current_time, "regime_direction",
                                       market_regime=current_regime, probs=prob_dict)
 
+        # 9b. Global direction filter (long_only / short_only)
+        direction_filter = getattr(exec_cfg, "direction_filter", "both")
+        intended_dir = "LONG" if probs[2] > probs[0] else "SHORT"
+        
+        if direction_filter == "long_only" and intended_dir == "SHORT":
+            logger.info("Global direction filter: SHORT blocked (long_only mode)")
+            return self._no_trade(current_price, current_time, "direction_blocked",
+                                  market_regime=current_regime, probs=prob_dict)
+        if direction_filter == "short_only" and intended_dir == "LONG":
+            logger.info("Global direction filter: LONG blocked (short_only mode)")
+            return self._no_trade(current_price, current_time, "direction_blocked",
+                                  market_regime=current_regime, probs=prob_dict)
+
+
         # 10. Compute adaptive TP/SL multipliers
         adaptive = self._compute_adaptive_tp_sl(atr_percentile, exec_cfg)
         full_tp_atr = adaptive.get("adaptive_full_tp_atr", exec_cfg.trade_management.full_tp_atr)
