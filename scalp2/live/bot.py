@@ -203,9 +203,13 @@ class LiveBot:
         self.encoder.eval()
 
         # XGBoost
-        self.xgb = XGBoostMetaLearner(self.config.model.xgboost)
-        xgb_path = self.checkpoint_dir / f"xgb_fold_{fold_idx:03d}.json"
-        self.xgb.load(str(xgb_path))
+        if getattr(self.config.model, "bypass_xgboost", False):
+            self.xgb = None
+            logger.info("XGBoost bypassed via config.")
+        else:
+            self.xgb = XGBoostMetaLearner(self.config.model.xgboost)
+            xgb_path = self.checkpoint_dir / f"xgb_fold_{fold_idx:03d}.json"
+            self.xgb.load(str(xgb_path))
 
         logger.info("Model loaded: %d params, %d features, fold %d",
                      self.encoder.count_parameters(), len(self.feature_names), fold_idx)
