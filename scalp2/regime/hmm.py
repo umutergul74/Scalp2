@@ -342,6 +342,14 @@ class RegimeDetector:
         n_states = self.config.n_states
         init_weight = float(self.config.online_min_samples)
 
+        # Snapshot trained parameters — used by _enforce_state_floor to
+        # reconstruct starving states from their *original* distribution
+        # instead of copying the dominant state's profile.
+        self._trained_means_snapshot = self.model.means_.copy()
+        self._trained_covars_snapshot = getattr(
+            self.model, "_covars_", self.model.covars_
+        ).copy()
+
         # Seed sufficient stats from trained model parameters
         internal_covars = getattr(self.model, "_covars_", self.model.covars_)
         w = init_weight / n_states
@@ -374,15 +382,19 @@ class RegimeDetector:
     # ── Health monitoring ──────────────────────────────────────────────
 
     # Minimum fraction of total N any single state must hold
-    _MIN_STATE_WEIGHT_FRAC = 0.02  # 2% — below this we redistribute
+    _MIN_STATE_WEIGHT_FRAC = 0.08  # 8% — below this we redistribute
     # Absolute floor for SS values (below this = numerical underflow)
     _SS_UNDERFLOW_THRESHOLD = 1e-100
     # Maximum ratio between largest and smallest N before alarm
-    _MAX_N_RATIO = 50.0
+    _MAX_N_RATIO = 15.0
     # Minimum transition probability floor (prevents transition death)
     _MIN_TRANS_FRAC = 0.005  # 0.5% — any transition must have at least this prob
     # Minimum off-diagonal transition count ratio before warning
     _MIN_TRANS_COUNT_RATIO = 1e-4
+    # Minimum gamma (responsibility) per state per bar — breaks the
+    # positive feedback loop where gamma→1 for one state → only that
+    # state accumulates → re-estimation reinforces → stuck forever.
+    _GAMMA_FLOOR = 0.02
 
     def health_check(self) -> dict:
         """Check HMM online stats for collapse symptoms.
@@ -483,8 +495,11 @@ class RegimeDetector:
         """Redistribute weight to prevent any state from dying.
 
         If a state's N drops below MIN_FRAC of total, steal weight from
-        the dominant state and give it to the starving one. This prevents
-        the positive feedback loop that causes collapse.
+        the dominant state and *reconstruct* the starving state's
+        sufficient statistics from the trained model snapshot. This is
+        critical: the old approach copied S/SX from the dominant state,
+        which made all states converge to the same distribution and
+        destroyed the HMM's discriminative ability.
 
         Also floors transition counts to prevent any transition path
         from dying (which causes the forward pass to get stuck).
@@ -496,37 +511,56 @@ class RegimeDetector:
             return
 
         min_weight = total_n * self._MIN_STATE_WEIGHT_FRAC
-        dominant = int(np.argmax(stats.N))
+        has_snapshot = hasattr(self, '_trained_means_snapshot')
 
         for s in range(n_states):
+            # Recalculate dominant each iteration — a previous
+            # redistribution may have changed who the dominant is.
+            dominant = int(np.argmax(stats.N))
             if s == dominant:
                 continue
             if stats.N[s] < min_weight:
                 deficit = min_weight - stats.N[s]
-                # Transfer from dominant to starving state
+                # Transfer N from dominant, cap at 30% of dominant weight
                 transfer_frac = deficit / (stats.N[dominant] + 1e-10)
-                transfer_frac = min(transfer_frac, 0.1)  # cap at 10%
+                transfer_frac = min(transfer_frac, 0.30)
                 actual_transfer = stats.N[dominant] * transfer_frac
 
                 stats.N[s] += actual_transfer
                 stats.N[dominant] -= actual_transfer
 
-                # Also transfer proportional S and SX
-                stats.S[s] += stats.S[dominant] * transfer_frac
-                stats.S[dominant] *= (1 - transfer_frac)
-
-                if stats.SX is not None:
-                    stats.SX[s] += stats.SX[dominant] * transfer_frac
-                    stats.SX[dominant] *= (1 - transfer_frac)
+                # Reconstruct starving state's stats from TRAINED params
+                # instead of copying dominant (prevents convergence)
+                if has_snapshot:
+                    mu = self._trained_means_snapshot[s]
+                    stats.S[s] = mu * stats.N[s]
+                    if stats.SX is not None:
+                        stats.SX[s] = (
+                            self._trained_covars_snapshot[s]
+                            + np.outer(mu, mu)
+                        ) * stats.N[s]
+                    else:
+                        stats.SS[s] = (
+                            self._trained_covars_snapshot[s] + mu ** 2
+                        ) * stats.N[s]
                 else:
-                    stats.SS[s] += stats.SS[dominant] * transfer_frac
-                    stats.SS[dominant] *= (1 - transfer_frac)
+                    # Fallback: old transfer method
+                    stats.S[s] += stats.S[dominant] * transfer_frac
+                    stats.S[dominant] *= (1 - transfer_frac)
+                    if stats.SX is not None:
+                        stats.SX[s] += stats.SX[dominant] * transfer_frac
+                        stats.SX[dominant] *= (1 - transfer_frac)
+                    else:
+                        stats.SS[s] += stats.SS[dominant] * transfer_frac
+                        stats.SS[dominant] *= (1 - transfer_frac)
 
                 logger.warning(
                     'HMM state floor: redistributed %.2f weight from '
-                    'state %d -> state %d (N was %.4f, now %.4f)',
+                    'state %d -> state %d (N was %.4f, now %.4f), '
+                    'reconstructed=%s',
                     actual_transfer, dominant, s,
                     stats.N[s] - actual_transfer, stats.N[s],
+                    has_snapshot,
                 )
 
         # -- Transition count floor ------------------------------------
@@ -586,6 +620,14 @@ class RegimeDetector:
         if not hasattr(self, "_online_stats"):
             self._init_online_stats()
 
+        # Ensure trained parameter snapshots exist — pickle-loaded models
+        # and set_online_stats_dict() restores may not have them.
+        if not hasattr(self, '_trained_means_snapshot'):
+            self._trained_means_snapshot = self.model.means_.copy()
+            self._trained_covars_snapshot = getattr(
+                self.model, "_covars_", self.model.covars_
+            ).copy()
+
         stats = self._online_stats
         decay = self.config.online_decay_factor
         n_new = len(df)
@@ -608,6 +650,13 @@ class RegimeDetector:
 
         # 4. Forward-only pass for state responsibilities
         gamma = self._forward_only_gamma(X_scaled)
+
+        # 4b. Gamma floor: ensure every state gets minimum responsibility
+        # on every bar. Without this, prolonged single-regime periods
+        # cause gamma≈[1,0,0] → only one state accumulates stats →
+        # re-estimation reinforces that state → positive feedback → collapse.
+        gamma = np.maximum(gamma, self._GAMMA_FLOOR)
+        gamma /= gamma.sum(axis=1, keepdims=True)
 
         # 5. Decay existing stats then accumulate new
         batch_decay = decay**n_new
@@ -667,7 +716,8 @@ class RegimeDetector:
                     health['issues'],
                 )
                 self.reset_online_stats()
-                stats.bars_since_update = 0
+                # Re-bind: reset_online_stats() created a new object
+                self._online_stats.bars_since_update = 0
                 return False
 
             self._reestimate_from_stats()
@@ -788,3 +838,13 @@ class RegimeDetector:
             bars_since_update=data["bars_since_update"],
             SX=np.array(data["SX"]) if "SX" in data else None,
         )
+
+        # Ensure trained parameter snapshots exist so _enforce_state_floor
+        # can reconstruct starving states from trained params (not dominant).
+        # Without this, bot restart → set_online_stats_dict → no snapshots
+        # → fallback to old convergent copy-from-dominant method.
+        if not hasattr(self, '_trained_means_snapshot') and self._fitted:
+            self._trained_means_snapshot = self.model.means_.copy()
+            self._trained_covars_snapshot = getattr(
+                self.model, "_covars_", self.model.covars_
+            ).copy()
