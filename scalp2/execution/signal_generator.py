@@ -179,12 +179,21 @@ class SignalGenerator:
                         atr_percentile, exec_cfg.min_atr_percentile)
             return self._no_trade(current_price, current_time, "low_volatility", market_regime=current_regime, probs=prob_dict)
 
-        # 8. Confidence check
-        max_prob = max(probs[0], probs[2])
+        # 8. Confidence check (direction-aware in filtered modes)
+        # In long_only mode we only care about prob_long strength;
+        # prob_short being high is irrelevant since we won't trade it.
+        direction_filter = getattr(exec_cfg, "direction_filter", "both")
+        if direction_filter == "long_only":
+            max_prob = float(probs[2])  # prob_long only
+        elif direction_filter == "short_only":
+            max_prob = float(probs[0])  # prob_short only
+        else:
+            max_prob = max(probs[0], probs[2])
+
         if max_prob < exec_cfg.confidence_threshold:
             logger.info(
-                "Low confidence (max=%.3f < %.3f), skipping",
-                max_prob, exec_cfg.confidence_threshold,
+                "Low confidence (max=%.3f < %.3f, filter=%s), skipping",
+                max_prob, exec_cfg.confidence_threshold, direction_filter,
             )
             return self._no_trade(current_price, current_time, "low_confidence", market_regime=current_regime, probs=prob_dict)
 
@@ -201,32 +210,48 @@ class SignalGenerator:
                                       market_regime=current_regime, probs=prob_dict)
 
         # 9b. Global direction filter (long_only / short_only)
+        # In directional modes, skip the prob_short vs prob_long gate.
+        # The model's 3-class output is still logged, but execution only
+        # cares whether the ALLOWED direction's probability is strong enough.
+        # This prevents the deadlock where the unreliable class (short in
+        # long_only) blocks all trades by perpetually winning the argmax.
         direction_filter = getattr(exec_cfg, "direction_filter", "both")
-        intended_dir = "LONG" if probs[2] > probs[0] else "SHORT"
-        
-        if direction_filter == "long_only" and intended_dir == "SHORT":
-            logger.info("Global direction filter: SHORT blocked (long_only mode)")
-            return self._no_trade(current_price, current_time, "direction_blocked",
-                                  market_regime=current_regime, probs=prob_dict)
-        if direction_filter == "short_only" and intended_dir == "LONG":
-            logger.info("Global direction filter: LONG blocked (short_only mode)")
-            return self._no_trade(current_price, current_time, "direction_blocked",
-                                  market_regime=current_regime, probs=prob_dict)
 
+        if direction_filter == "long_only":
+            # Always evaluate as LONG — let confidence threshold decide
+            direction = Direction.LONG
+            confidence = float(probs[2])  # prob_long
+            logger.info(
+                "long_only mode: evaluating LONG with confidence=%.3f "
+                "(probs: short=%.3f hold=%.3f long=%.3f)",
+                confidence, probs[0], probs[1], probs[2],
+            )
+        elif direction_filter == "short_only":
+            direction = Direction.SHORT
+            confidence = float(probs[0])  # prob_short
+            logger.info(
+                "short_only mode: evaluating SHORT with confidence=%.3f "
+                "(probs: short=%.3f hold=%.3f long=%.3f)",
+                confidence, probs[0], probs[1], probs[2],
+            )
+        else:
+            # 'both' mode: pick the stronger directional signal
+            if probs[2] > probs[0]:
+                direction = Direction.LONG
+                confidence = float(probs[2])
+            else:
+                direction = Direction.SHORT
+                confidence = float(probs[0])
 
         # 10. Compute adaptive TP/SL multipliers
         adaptive = self._compute_adaptive_tp_sl(atr_percentile, exec_cfg)
         full_tp_atr = adaptive.get("adaptive_full_tp_atr", exec_cfg.trade_management.full_tp_atr)
 
-        # 11. Determine direction
-        if probs[2] > probs[0]:
-            direction = Direction.LONG
-            confidence = float(probs[2])
+        # 11. Set TP/SL based on direction
+        if direction == Direction.LONG:
             tp = current_price + full_tp_atr * current_atr
             sl = current_price - self.config.labeling.sl_multiplier * current_atr
         else:
-            direction = Direction.SHORT
-            confidence = float(probs[0])
             tp = current_price - full_tp_atr * current_atr
             sl = current_price + self.config.labeling.sl_multiplier * current_atr
 
